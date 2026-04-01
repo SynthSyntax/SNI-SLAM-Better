@@ -1,0 +1,23 @@
+[workspace]
+channels = ["conda-forge"]
+name = "SNI-SLAM-Better"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[system-requirements]
+cuda = "12.2"
+
+[dependencies]
+pytorch-gpu = ">=2.10.0,<3"
+torchaudio = ">=2.10.0,<3"
+torchvision = ">=0.25.0,<0.26"
+wandb = ">=0.25.1,<0.26"
+gdown = ">=5.2.1,<6"
+pytorch3d = ">=0.7.9,<0.8"
+opencv = ">=4.13.0,<5"
+matplotlib = ">=3.10.8,<4"
+trimesh = ">=4.11.5,<5"
+open3d = ">=0.19.0,<0.20"
+scikit-image = ">=0.26.0,<0.27"

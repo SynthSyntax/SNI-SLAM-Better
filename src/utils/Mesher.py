@@ -172,13 +172,13 @@ class Mesher(object):
         padding = 0.05
 
         nsteps_x = ((bound[0][1] - bound[0][0] + 2 * padding) / resolution).round().int().item()
-        x = np.linspace(bound[0][0] - padding, bound[0][1] + padding, nsteps_x)
-        
+        x = np.linspace(bound[0][0].item() - padding, bound[0][1].item() + padding, nsteps_x)
+
         nsteps_y = ((bound[1][1] - bound[1][0] + 2 * padding) / resolution).round().int().item()
-        y = np.linspace(bound[1][0] - padding, bound[1][1] + padding, nsteps_y)
-        
+        y = np.linspace(bound[1][0].item() - padding, bound[1][1].item() + padding, nsteps_y)
+
         nsteps_z = ((bound[2][1] - bound[2][0] + 2 * padding) / resolution).round().int().item()
-        z = np.linspace(bound[2][0] - padding, bound[2][1] + padding, nsteps_z)
+        z = np.linspace(bound[2][0].item() - padding, bound[2][1].item() + padding, nsteps_z)
 
         x_t, y_t, z_t = torch.from_numpy(x).float(), torch.from_numpy(y).float(), torch.from_numpy(z).float()
         grid_x, grid_y, grid_z = torch.meshgrid(x_t, y_t, z_t, indexing='xy')
@@ -204,19 +204,29 @@ class Mesher(object):
         with torch.no_grad():
             grid = self.get_grid_uniform(self.resolution)
             points = grid['grid_points']
+            n_batches = len(torch.split(points, self.points_batch_size, dim=0))
+            print(f'Meshing: {len(points)} grid points in {n_batches} batches')
+
+            print('Meshing [1/4]: computing scene bounds...')
             mesh_bound = self.get_bound_from_frames(keyframe_dict, self.scale)
 
             z = []
             mask = []
+            print('Meshing [2/4]: masking points...')
             for i, pnts in enumerate(torch.split(points, self.points_batch_size, dim=0)):
                 mask.append(mesh_bound.contains(pnts.cpu().numpy()))
+                print(f'  batch {i+1}/{n_batches}', end='\r')
             mask = np.concatenate(mask, axis=0)
 
+            print(f'\nMeshing [3/4]: evaluating TSDF...')
             for i, pnts in enumerate(torch.split(points, self.points_batch_size, dim=0)):
                 z.append(self.eval_points(pnts.to(device), all_planes, decoders, color=True).cpu().numpy()[:, 3])
+                print(f'  batch {i+1}/{n_batches}', end='\r')
             z = np.concatenate(z, axis=0)
+            print()
             z[~mask] = -1
 
+            print('Meshing [4/4]: running marching cubes...')
             try:
                 if version.parse(
                         skimage.__version__) > version.parse('0.15.0'):
@@ -273,13 +283,11 @@ class Mesher(object):
             if color:
                 mesh_color = trimesh.Trimesh(vertices, faces, vertex_colors=vertex_colors)
                 mesh_color.export(mesh_out_color)
+                print(f'Saved color mesh: {mesh_out_color}')
             if semantic:
                 mesh_semantic = trimesh.Trimesh(vertices, faces, vertex_colors=vertex_semantic)
                 mesh_semantic.export(mesh_out_semantic)
-                print('Saved mesh at', mesh_out_semantic)
-
-            if self.verbose:
-                print('Saved mesh at', mesh_out_semantic)
+                print(f'Saved semantic mesh: {mesh_out_semantic}')
 
     def decode_segmap(self, image, nc):
         label_colors = np.array([(0, 0, 0),  # 0=background

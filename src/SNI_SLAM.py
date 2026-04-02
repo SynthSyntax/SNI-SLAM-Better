@@ -256,10 +256,63 @@ class SNI_SLAM():
 
         self.mapper.run()
 
+    def load_ckpt(self, ckpt_path):
+        """Load checkpoint and restore planes, decoders, poses, keyframe list."""
+        print(f'Loading checkpoint: {ckpt_path}')
+        ckpt = torch.load(ckpt_path, map_location=self.device)
+        self.shared_decoders.load_state_dict(ckpt['decoder_state_dict'])
+        for i, p in enumerate(ckpt['planes_xy']):  self.shared_planes_xy[i].data.copy_(p)
+        for i, p in enumerate(ckpt['planes_xz']):  self.shared_planes_xz[i].data.copy_(p)
+        for i, p in enumerate(ckpt['planes_yz']):  self.shared_planes_yz[i].data.copy_(p)
+        for i, p in enumerate(ckpt['c_planes_xy']): self.shared_c_planes_xy[i].data.copy_(p)
+        for i, p in enumerate(ckpt['c_planes_xz']): self.shared_c_planes_xz[i].data.copy_(p)
+        for i, p in enumerate(ckpt['c_planes_yz']): self.shared_c_planes_yz[i].data.copy_(p)
+        for i, p in enumerate(ckpt['s_planes_xy']): self.shared_s_planes_xy[i].data.copy_(p)
+        for i, p in enumerate(ckpt['s_planes_xz']): self.shared_s_planes_xz[i].data.copy_(p)
+        for i, p in enumerate(ckpt['s_planes_yz']): self.shared_s_planes_yz[i].data.copy_(p)
+        self.estimate_c2w_list[:] = ckpt['estimate_c2w_list']
+        return ckpt['keyframe_list'], ckpt['idx']
+
+    def run_mesh_only(self):
+        """Load latest checkpoint and generate mesh without re-running tracking/mapping."""
+        ckpts = sorted(os.listdir(self.ckptsdir))
+        assert len(ckpts) > 0, f'No checkpoints found in {self.ckptsdir}'
+        ckpt_path = os.path.join(self.ckptsdir, ckpts[-1])
+        keyframe_list, idx = self.load_ckpt(ckpt_path)
+
+        # Reconstruct keyframe_dict from disk using saved keyframe indices
+        keyframe_dict = []
+        for ki in keyframe_list:
+            _, gt_color, gt_depth, gt_c2w, _ = self.frame_reader[ki]
+            keyframe_dict.append({
+                'idx': ki,
+                'gt_c2w': gt_c2w.to(self.device),
+                'color': gt_color.to(self.device),
+                'depth': gt_depth.to(self.device),
+                'est_c2w': self.estimate_c2w_list[ki].clone(),
+            })
+
+        all_planes = (self.shared_planes_xy, self.shared_planes_xz, self.shared_planes_yz,
+                      self.shared_c_planes_xy, self.shared_c_planes_xz, self.shared_c_planes_yz,
+                      self.shared_s_planes_xy, self.shared_s_planes_xz, self.shared_s_planes_yz)
+
+        print(f'Generating mesh from checkpoint at idx {idx}...')
+        mesh_out_semantic = f'{self.output}/mesh/final_mesh_semantic.ply'
+        mesh_out_color = f'{self.output}/mesh/final_mesh_color.ply'
+        self.mesher.get_mesh(mesh_out_color, all_planes, self.shared_decoders, keyframe_dict,
+                             self.device, mesh_out_semantic=mesh_out_semantic, semantic=False)
+        from src.tools.cull_mesh import cull_mesh
+        cull_mesh(mesh_out_color, self.cfg, self.args, self.device,
+                  estimate_c2w_list=self.estimate_c2w_list)
+
     def run(self):
         """
         Dispatch Threads.
         """
+
+        if self.args.mesh_only:
+            self.run_mesh_only()
+            return
 
         processes = []
         for rank in range(0, 2):

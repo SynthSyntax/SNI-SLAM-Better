@@ -17,25 +17,55 @@ Siting Zhu*, Guangming Wang*, Hermann Blum, Jiuming Liu, Liang Song, Marc Pollef
 
 ## Installation
 
-First you have to make sure that you have all dependencies in place.
-The simplest way to do so, is to use [anaconda](https://www.anaconda.com/). 
+This repo uses [pixi](https://pixi.sh) for dependency management (Python 3.14, PyTorch, CUDA 12).
 
-You can create an anaconda environment called `sni`. For linux, you need to install **libopenexr-dev** before creating the environment.
 ```bash
-sudo apt-get install libopenexr-dev
-conda env create -f environment.yaml
-conda activate sni
+# Install pixi if you don't have it
+curl -fsSL https://pixi.sh/install.sh | bash
+
+# Install all dependencies
+pixi install
 ```
+
+> **Note:** The original repo used conda + `environment.yaml` targeting Python 3.7 and CUDA 11.3. This version has been updated to use pixi with a modern stack (Python 3.14, CUDA 12+). The `environment.yaml` is kept for reference but is not used.
 
 ## Run
 ### Replica
-1. Download the data with semantic annotations in [google drive](https://drive.google.com/drive/u/0/folders/1BCu8bCGKG9HmnLFbyx7DIHI0slgkeo4h) and save the data into the `./data/replica` folder. We only provide a subset of Replica dataset. For all Replica data generation, please refer to directory `data_generation`. 
-2. Download the pretrained segmentation network in [google drive](https://drive.google.com/drive/u/0/folders/1BCu8bCGKG9HmnLFbyx7DIHI0slgkeo4h) and save it into the `./seg` folder (unzip `seg/facebookresearch_dinov2_main.zip`),
-and you can run SNI-SLAM:
+1. Download the data with semantic annotations in [google drive](https://drive.google.com/drive/u/0/folders/1BCu8bCGKG9HmnLFbyx7DIHI0slgkeo4h) and save the data into the `./data/replica` folder. We only provide a subset of Replica dataset. For all Replica data generation, please refer to directory `data_generation`.
+2. Download the pretrained segmentation network in [google drive](https://drive.google.com/drive/u/0/folders/1BCu8bCGKG9HmnLFbyx7DIHI0slgkeo4h) and save it into the `./seg` folder (unzip `seg/facebookresearch_dinov2_main.zip`).
+
+Run SNI-SLAM:
 ```bash
-python -W ignore run.py configs/Replica/room1.yaml
+pixi run python -W ignore run.py configs/Replica/room1.yaml
 ```
 The mesh for evaluation is saved as `$OUTPUT_FOLDER/mesh/final_mesh_eval_rec_culled.ply`
+
+### Quick test with fewer frames
+
+To test the pipeline without running all frames, add `n_img` to your config:
+```yaml
+# in configs/Replica/room1.yaml
+data:
+  input_folder: data/replica/room_1/
+  output: output/Replica/room1/test
+  n_img: 200  # remove this line for the full run
+```
+
+You can also set a coarser meshing resolution to speed up mesh generation:
+```yaml
+meshing:
+  resolution: 0.05  # default is 0.01 — larger = faster but lower quality
+```
+
+### Mesh-only mode (skip re-running tracking/mapping)
+
+If tracking and mapping already completed but mesh generation failed, you can reload the last checkpoint and regenerate the mesh without reprocessing all frames:
+
+```bash
+pixi run python -W ignore run.py configs/Replica/room1.yaml --mesh_only
+```
+
+This loads the latest checkpoint from `$OUTPUT_FOLDER/ckpts/`, reconstructs the keyframe data from disk, and runs meshing directly.
 
 
 ## Evaluation
@@ -44,7 +74,7 @@ The mesh for evaluation is saved as `$OUTPUT_FOLDER/mesh/final_mesh_eval_rec_cul
 To evaluate the average trajectory error. Run the command below with the corresponding config file:
 ```bash
 # An example for room1 of Replica
-python src/tools/eval_ate.py configs/Replica/room1.yaml
+pixi run python src/tools/eval_ate.py configs/Replica/room1.yaml
 ```
 ### Reconstruction Metrics
 We follow [code](https://github.com/JingwenWang95/neural_slam_eval) for reconstruction evaluation.
@@ -55,7 +85,7 @@ For visualizing the results, we recommend to set `mesh_freq: 40` in [configs/SNI
 After SNI-SLAM is trained, run the following command for visualization.
 
 ```bash
-python visualizer.py configs/Replica/room1.yaml --top_view --save_rendering
+pixi run python visualizer.py configs/Replica/room1.yaml --top_view --save_rendering
 ```
 The result of the visualization will be saved at `output/Replica/room1/vis.mp4`. The green trajectory indicates the ground truth trajectory, and the red one is the trajectory of SNI-SLAM.
 

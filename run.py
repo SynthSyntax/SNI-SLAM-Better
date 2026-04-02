@@ -14,6 +14,8 @@ def main():
                         help='input folder, this have higher priority, can overwrite the one in config file')
     parser.add_argument('--output', type=str,
                         help='output folder, this have higher priority, can overwrite the one in config file')
+    parser.add_argument('--mesh_only', action='store_true',
+                        help='skip tracking/mapping, load latest checkpoint and generate mesh only')
     args = parser.parse_args()
 
     cfg = config.load_config(args.config, 'configs/SNI-SLAM.yaml')

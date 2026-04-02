@@ -6,7 +6,7 @@ import trimesh
 
 
 # path_in = 'path/to/mesh_semantic.ply'
-path_in = '/data0/vmap/room_0_debug/habitat/mesh_semantic.ply'
+path_in = '/data/vmap/room_0_debug/habitat/mesh_semantic.ply'
 
 print("Reading input...")
 mesh = trimesh.load(path_in)

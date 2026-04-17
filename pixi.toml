@@ -8,6 +8,9 @@ version = "0.1.0"
 install-tcnn = { cmd = "LD_LIBRARY_PATH=$CONDA_PREFIX/targets/x86_64-linux/lib:$LD_LIBRARY_PATH python -m pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch --no-build-isolation" }
 run = { cmd = "python run.py" }
 
+[activation]
+env = { CONDA_OVERRIDE_CUDA = "12.2" }
+
 [system-requirements]
 cuda = "12.2"
 

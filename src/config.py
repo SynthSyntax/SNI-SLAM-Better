@@ -68,7 +68,7 @@ def update_recursive(dict1, dict2):
 
 
 # Models
-def get_model(cfg):
-    model = networks.config.get_model(cfg)
+def get_model(cfg, bound):
+    model = networks.config.get_model(cfg, bound)
 
     return model

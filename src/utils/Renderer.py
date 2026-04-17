@@ -21,7 +21,7 @@
 
 
 import torch
-from src.common import get_rays, sample_pdf, normalize_3d_coordinate
+from src.common import get_rays, sample_pdf
 
 class Renderer(object):
     def __init__(self, cfg, sni, ray_batch_size=10000):
@@ -58,7 +58,7 @@ class Renderer(object):
 
         return lower + (upper - lower) * t_rand
 
-    def render_batch_ray(self, all_planes, decoders, rays_d, rays_o, device, truncation, gt_depth=None,
+    def render_batch_ray(self, decoders, rays_d, rays_o, device, truncation, gt_depth=None,
                         sem_feats=None, rgb_feats=None, return_emb=False):
         n_stratified = self.n_stratified
         n_importance = self.n_importance
@@ -103,8 +103,7 @@ class Renderer(object):
                     z_vals_uni = self.perturbation(z_vals_uni)
                 pts_uni = rays_o_uni.unsqueeze(1) + rays_d_uni.unsqueeze(1) * z_vals_uni.unsqueeze(-1)
 
-                pts_uni_nor = normalize_3d_coordinate(pts_uni.clone(), self.bound)
-                sdf_uni, _ = decoders.get_raw_sdf(pts_uni_nor, all_planes[:6])
+                sdf_uni, _ = decoders.get_raw_sdf(pts_uni)
                 sdf_uni = sdf_uni.reshape(*pts_uni.shape[0:2])
                 alpha_uni = self.sdf2alpha(sdf_uni, decoders.beta)
                 weights_uni = alpha_uni * torch.cumprod(torch.cat([torch.ones((alpha_uni.shape[0], 1), device=device)
@@ -131,7 +130,7 @@ class Renderer(object):
             fused_feat = torch.cat([rgb_fused_feat, depth_feats, sem_fused_feat], dim=2)
             fused_feat = fused_feat.reshape(-1, fused_feat.shape[-1])
 
-        raw, plane_feat = decoders(pts, all_planes)
+        raw, plane_feat = decoders(pts)
         alpha = self.sdf2alpha(raw[..., 3], decoders.beta)
         weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=device)
                                                 ,(1. - alpha + 1e-10)], -1), -1)[:, :-1]
@@ -154,7 +153,7 @@ class Renderer(object):
     def sdf2alpha(self, sdf, beta=10):
         return 1. - torch.exp(-beta * torch.sigmoid(-sdf * beta))
 
-    def render_img(self, all_planes, decoders, c2w, truncation, device, gt_depth=None):
+    def render_img(self, decoders, c2w, truncation, device, gt_depth=None):
         """
         Renders out depth and color images.
         Args:
@@ -188,11 +187,11 @@ class Renderer(object):
                 rays_d_batch = rays_d[i:i+ray_batch_size]
                 rays_o_batch = rays_o[i:i+ray_batch_size]
                 if gt_depth is None:
-                    ret = self.render_batch_ray(all_planes, decoders, rays_d_batch, rays_o_batch,
+                    ret = self.render_batch_ray(decoders, rays_d_batch, rays_o_batch,
                                                 device, truncation, gt_depth=None)
                 else:
                     gt_depth_batch = gt_depth[i:i+ray_batch_size]
-                    ret = self.render_batch_ray(all_planes, decoders, rays_d_batch, rays_o_batch,
+                    ret = self.render_batch_ray(decoders, rays_d_batch, rays_o_batch,
                                                 device, truncation, gt_depth=gt_depth_batch)
 
                 depth, color, _, _, _, _, semantic = ret

@@ -52,7 +52,7 @@ class Frame_Visualizer(object):
 
         self.metric = SegmentationMetric(self.n_classes)
 
-    def save_imgs(self, idx, iter, gt_depth, gt_color, c2w_or_camera_tensor, all_planes, decoders, gt_sem=None, est_sem=None):
+    def save_imgs(self, idx, iter, gt_depth, gt_color, c2w_or_camera_tensor, decoders, gt_sem=None, est_sem=None):
         """
         Visualization of depth and color images and save to file.
         Args:
@@ -62,8 +62,7 @@ class Frame_Visualizer(object):
             gt_color (tensor): ground truth color image of the current frame.
             c2w_or_camera_tensor (tensor): camera pose, represented in 
                 camera to world matrix or quaternion and translation tensor.
-            all_planes (Tuple): feature planes.
-            decoders (torch.nn.Module): decoders for TSDF and color.
+            decoders (nn.Module): decoders with embedded hash fields.
         """
         with torch.no_grad():
             if (idx % self.freq == 0) and (iter % self.inside_freq == 0):
@@ -75,7 +74,7 @@ class Frame_Visualizer(object):
                 else:
                     c2w = c2w_or_camera_tensor.squeeze().detach()
 
-                depth, color, semantic = self.renderer.render_img(all_planes, decoders, c2w, self.truncation,
+                depth, color, semantic = self.renderer.render_img(decoders, c2w, self.truncation,
                                                         self.device, gt_depth=gt_depth)
 
                 depth_np = depth.detach().cpu().numpy()

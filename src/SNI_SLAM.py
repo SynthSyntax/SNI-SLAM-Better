@@ -47,13 +47,11 @@ class SNI_SLAM():
             'W'], cfg['cam']['fx'], cfg['cam']['fy'], cfg['cam']['cx'], cfg['cam']['cy']
         self.update_cam()
 
-        model = config.get_model(cfg)
-        self.shared_decoders = model
-
         self.scale = cfg['scale']
-
         self.load_bound(cfg)
-        self.init_planes(cfg)
+
+        model = config.get_model(cfg, self.bound)
+        self.shared_decoders = model
 
         self.enable_wandb = cfg['func']['enable_wandb']
         if self.enable_wandb:
@@ -83,25 +81,6 @@ class SNI_SLAM():
         self.mapping_idx.share_memory_()
         self.mapping_cnt = torch.zeros((1)).int()  # counter for mapping
         self.mapping_cnt.share_memory_()
-
-        ## Moving feature planes and decoders to the processing device
-        for shared_planes in [self.shared_planes_xy, self.shared_planes_xz, self.shared_planes_yz]:
-            for i, plane in enumerate(shared_planes):
-                plane = plane.to(self.device)
-                plane.share_memory_()
-                shared_planes[i] = plane
-
-        for shared_c_planes in [self.shared_c_planes_xy, self.shared_c_planes_xz, self.shared_c_planes_yz]:
-            for i, plane in enumerate(shared_c_planes):
-                plane = plane.to(self.device)
-                plane.share_memory_()
-                shared_c_planes[i] = plane
-
-        for shared_s_planes in [self.shared_s_planes_xy, self.shared_s_planes_xz, self.shared_s_planes_yz]:
-            for i, plane in enumerate(shared_s_planes):
-                plane = plane.to(self.device)
-                plane.share_memory_()
-                shared_s_planes[i] = plane
 
         self.shared_decoders = self.shared_decoders.to(self.device)
         self.shared_decoders.share_memory()
@@ -149,86 +128,8 @@ class SNI_SLAM():
             self.cy -= self.cfg['cam']['crop_edge']
 
     def load_bound(self, cfg):
-        """
-        Pass the scene bound parameters to different decoders and self.
-
-        Args:
-            cfg (dict): parsed config dict.
-        """
-
-        # scale the bound if there is a global scaling factor
-        self.bound = torch.from_numpy(np.array(cfg['mapping']['bound'])*self.scale).float()
-        bound_dividable = cfg['planes_res']['bound_dividable']
-        # enlarge the bound a bit to allow it dividable by bound_dividable
-        self.bound[:, 1] = (((self.bound[:, 1]-self.bound[:, 0]) /
-                            bound_dividable).int()+1)*bound_dividable+self.bound[:, 0]
-        self.shared_decoders.bound = self.bound
-
-    def init_planes(self, cfg):
-        """
-        Initialize the feature planes.
-
-        Args:
-            cfg (dict): parsed config dict.
-        """
-
-        self.coarse_planes_res = cfg['planes_res']['coarse']
-        self.fine_planes_res = cfg['planes_res']['fine']
-
-        self.coarse_c_planes_res = cfg['c_planes_res']['coarse']
-        self.fine_c_planes_res = cfg['c_planes_res']['fine']
-
-        self.coarse_s_planes_res = cfg['s_planes_res']['coarse']
-        self.fine_s_planes_res = cfg['s_planes_res']['fine']
-
-
-
-        c_dim = cfg['model']['c_dim']
-        # print("c_dim", c_dim)
-        xyz_len = self.bound[:, 1]-self.bound[:, 0]
-
-        ####### Initializing Planes ############
-        planes_xy, planes_xz, planes_yz = [], [], []
-        c_planes_xy, c_planes_xz, c_planes_yz = [], [], []
-        s_planes_xy, s_planes_xz, s_planes_yz = [], [], []
-
-        planes_res = [self.coarse_planes_res, self.fine_planes_res]
-        c_planes_res = [self.coarse_c_planes_res, self.fine_c_planes_res]
-        s_planes_res = [self.coarse_s_planes_res, self.fine_s_planes_res]
-
-        planes_dim = c_dim
-        for grid_res in planes_res:
-            grid_shape = list(map(int, (xyz_len / grid_res).tolist()))
-            grid_shape[0], grid_shape[2] = grid_shape[2], grid_shape[0]
-            planes_xy.append(torch.empty([1, planes_dim, *grid_shape[1:]]).normal_(mean=0, std=0.01))
-            planes_xz.append(torch.empty([1, planes_dim, grid_shape[0], grid_shape[2]]).normal_(mean=0, std=0.01))
-            planes_yz.append(torch.empty([1, planes_dim, *grid_shape[:2]]).normal_(mean=0, std=0.01))
-
-        for grid_res in c_planes_res:
-            grid_shape = list(map(int, (xyz_len / grid_res).tolist()))
-            grid_shape[0], grid_shape[2] = grid_shape[2], grid_shape[0]
-            c_planes_xy.append(torch.empty([1, planes_dim, *grid_shape[1:]]).normal_(mean=0, std=0.01))
-            c_planes_xz.append(torch.empty([1, planes_dim, grid_shape[0], grid_shape[2]]).normal_(mean=0, std=0.01))
-            c_planes_yz.append(torch.empty([1, planes_dim, *grid_shape[:2]]).normal_(mean=0, std=0.01))
-
-        for grid_res in s_planes_res:
-            grid_shape = list(map(int, (xyz_len / grid_res).tolist()))
-            grid_shape[0], grid_shape[2] = grid_shape[2], grid_shape[0]
-            s_planes_xy.append(torch.empty([1, planes_dim, *grid_shape[1:]]).normal_(mean=0, std=0.01))
-            s_planes_xz.append(torch.empty([1, planes_dim, grid_shape[0], grid_shape[2]]).normal_(mean=0, std=0.01))
-            s_planes_yz.append(torch.empty([1, planes_dim, *grid_shape[:2]]).normal_(mean=0, std=0.01))
-
-        self.shared_planes_xy = planes_xy
-        self.shared_planes_xz = planes_xz
-        self.shared_planes_yz = planes_yz
-
-        self.shared_c_planes_xy = c_planes_xy
-        self.shared_c_planes_xz = c_planes_xz
-        self.shared_c_planes_yz = c_planes_yz
-
-        self.shared_s_planes_xy = s_planes_xy
-        self.shared_s_planes_xz = s_planes_xz
-        self.shared_s_planes_yz = s_planes_yz
+        """Load scene bound from config (scaled). Hash grids normalize to this bound."""
+        self.bound = torch.from_numpy(np.array(cfg['mapping']['bound']) * self.scale).float()
 
     def tracking(self, rank):
         """
@@ -257,19 +158,10 @@ class SNI_SLAM():
         self.mapper.run()
 
     def load_ckpt(self, ckpt_path):
-        """Load checkpoint and restore planes, decoders, poses, keyframe list."""
+        """Load checkpoint and restore decoder (hash grids live inside), poses, keyframe list."""
         print(f'Loading checkpoint: {ckpt_path}')
         ckpt = torch.load(ckpt_path, map_location=self.device)
         self.shared_decoders.load_state_dict(ckpt['decoder_state_dict'])
-        for i, p in enumerate(ckpt['planes_xy']):  self.shared_planes_xy[i].data.copy_(p)
-        for i, p in enumerate(ckpt['planes_xz']):  self.shared_planes_xz[i].data.copy_(p)
-        for i, p in enumerate(ckpt['planes_yz']):  self.shared_planes_yz[i].data.copy_(p)
-        for i, p in enumerate(ckpt['c_planes_xy']): self.shared_c_planes_xy[i].data.copy_(p)
-        for i, p in enumerate(ckpt['c_planes_xz']): self.shared_c_planes_xz[i].data.copy_(p)
-        for i, p in enumerate(ckpt['c_planes_yz']): self.shared_c_planes_yz[i].data.copy_(p)
-        for i, p in enumerate(ckpt['s_planes_xy']): self.shared_s_planes_xy[i].data.copy_(p)
-        for i, p in enumerate(ckpt['s_planes_xz']): self.shared_s_planes_xz[i].data.copy_(p)
-        for i, p in enumerate(ckpt['s_planes_yz']): self.shared_s_planes_yz[i].data.copy_(p)
         self.estimate_c2w_list[:] = ckpt['estimate_c2w_list']
         return ckpt['keyframe_list'], ckpt['idx']
 
@@ -292,14 +184,10 @@ class SNI_SLAM():
                 'est_c2w': self.estimate_c2w_list[ki].clone(),
             })
 
-        all_planes = (self.shared_planes_xy, self.shared_planes_xz, self.shared_planes_yz,
-                      self.shared_c_planes_xy, self.shared_c_planes_xz, self.shared_c_planes_yz,
-                      self.shared_s_planes_xy, self.shared_s_planes_xz, self.shared_s_planes_yz)
-
         print(f'Generating mesh from checkpoint at idx {idx}...')
         mesh_out_semantic = f'{self.output}/mesh/final_mesh_semantic.ply'
         mesh_out_color = f'{self.output}/mesh/final_mesh_color.ply'
-        self.mesher.get_mesh(mesh_out_color, all_planes, self.shared_decoders, keyframe_dict,
+        self.mesher.get_mesh(mesh_out_color, self.shared_decoders, keyframe_dict,
                              self.device, mesh_out_semantic=mesh_out_semantic, semantic=False)
         from src.tools.cull_mesh import cull_mesh
         cull_mesh(mesh_out_color, self.cfg, self.args, self.device,

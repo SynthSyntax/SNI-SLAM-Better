@@ -13,3 +13,7 @@ wandb/
 data/
 seg/
 output/
+output.zip
+
+#Slurm Scripts
+Slurm*

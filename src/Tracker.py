@@ -33,21 +33,9 @@ class Tracker(object):
         self.estimate_c2w_list = sni.estimate_c2w_list
         self.truncation = sni.truncation
 
-        self.shared_planes_xy = sni.shared_planes_xy
-        self.shared_planes_xz = sni.shared_planes_xz
-        self.shared_planes_yz = sni.shared_planes_yz
-
-        self.shared_c_planes_xy = sni.shared_c_planes_xy
-        self.shared_c_planes_xz = sni.shared_c_planes_xz
-        self.shared_c_planes_yz = sni.shared_c_planes_yz
-
         self.enable_wandb = cfg['func']['enable_wandb']
         if self.enable_wandb:
             self.wandb_run = sni.wandb_run
-
-        self.shared_s_planes_xy = sni.shared_s_planes_xy
-        self.shared_s_planes_xz = sni.shared_s_planes_xz
-        self.shared_s_planes_yz = sni.shared_s_planes_yz
 
         self.w_semantic = cfg['tracking']['w_semantic']
 
@@ -87,19 +75,6 @@ class Tracker(object):
         self.H, self.W, self.fx, self.fy, self.cx, self.cy = sni.H, sni.W, sni.fx, sni.fy, sni.cx, sni.cy
 
         self.decoders = copy.deepcopy(self.shared_decoders)
-
-        self.planes_xy = copy.deepcopy(self.shared_planes_xy)
-        self.planes_xz = copy.deepcopy(self.shared_planes_xz)
-        self.planes_yz = copy.deepcopy(self.shared_planes_yz)
-
-        self.c_planes_xy = copy.deepcopy(self.shared_c_planes_xy)
-        self.c_planes_xz = copy.deepcopy(self.shared_c_planes_xz)
-        self.c_planes_yz = copy.deepcopy(self.shared_c_planes_yz)
-
-        self.s_planes_xy = copy.deepcopy(self.shared_s_planes_xy)
-        self.s_planes_xz = copy.deepcopy(self.shared_s_planes_xz)
-        self.s_planes_yz = copy.deepcopy(self.shared_s_planes_yz)
-
         for p in self.decoders.parameters():
             p.requires_grad_(False)
 
@@ -155,10 +130,6 @@ class Tracker(object):
             loss (float): The value of loss.
         """
 
-        all_planes = (self.planes_xy, self.planes_xz, self.planes_yz,
-                      self.c_planes_xy, self.c_planes_xz, self.c_planes_yz,
-                      self.s_planes_xy, self.s_planes_xz, self.s_planes_yz)
-
         device = self.device
         H, W, fx, fy, cx, cy = self.H, self.W, self.fx, self.fy, self.cx, self.cy
 
@@ -170,7 +141,7 @@ class Tracker(object):
                                                                                  gt_depth, gt_color, device=device,
                                                                                  gt_label=gt_semantic, dim=self.c_dim)
 
-        depth, color, sdf, z_vals, _, _, render_semantic = self.renderer.render_batch_ray(all_planes, self.decoders, batch_rays_d, batch_rays_o,
+        depth, color, sdf, z_vals, _, _, render_semantic = self.renderer.render_batch_ray(self.decoders, batch_rays_d, batch_rays_o,
                                                                    self.device, self.truncation, gt_depth=batch_gt_depth)
 
         ## Filtering the rays for which the rendered depth error is greater than 10 times of the median depth error
@@ -219,42 +190,13 @@ class Tracker(object):
         return loss.item()
 
     def update_params_from_mapping(self):
-        """
-        Update the parameters of scene representation from the mapping thread.
-        """
+        """Snapshot the shared decoder (hash grids included) into the local tracking copy."""
         if self.mapping_idx[0] != self.prev_mapping_idx:
-            # if self.verbose:
-            #     print('Tracking: update the parameters from mapping')
-
             self.decoders.load_state_dict(self.shared_decoders.state_dict())
-
-            for planes, self_planes in zip(
-                    [self.shared_planes_xy, self.shared_planes_xz, self.shared_planes_yz],
-                    [self.planes_xy, self.planes_xz, self.planes_yz]):
-                for i, plane in enumerate(planes):
-                    self_planes[i] = plane.detach()
-
-            for c_planes, self_c_planes in zip(
-                    [self.shared_c_planes_xy, self.shared_c_planes_xz, self.shared_c_planes_yz],
-                    [self.c_planes_xy, self.c_planes_xz, self.c_planes_yz]):
-                for i, c_plane in enumerate(c_planes):
-                    self_c_planes[i] = c_plane.detach()
-
-            for s_planes, self_s_planes in zip(
-                    [self.shared_s_planes_xy, self.shared_s_planes_xz, self.shared_s_planes_yz],
-                    [self.s_planes_xy, self.s_planes_xz, self.s_planes_yz]):
-                for i, s_plane in enumerate(s_planes):
-                    self_s_planes[i] = s_plane.detach()
-
             self.prev_mapping_idx = self.mapping_idx[0].clone()
 
     def run(self):
         device = self.device
-
-        all_planes = (self.planes_xy, self.planes_xz, self.planes_yz,
-                      self.c_planes_xy, self.c_planes_xz, self.c_planes_yz,
-                      self.s_planes_xy, self.s_planes_xz, self.s_planes_yz)
-
 
         pbar = tqdm(self.frame_loader, smoothing=0.05)
 
@@ -279,7 +221,7 @@ class Tracker(object):
             if idx == 0 or self.use_gt_pose:
                 c2w = gt_c2w
                 if not self.no_vis_on_first_frame:
-                    self.visualizer.save_imgs(idx, 0, gt_depth, gt_color, c2w.squeeze(), all_planes, self.decoders)
+                    self.visualizer.save_imgs(idx, 0, gt_depth, gt_color, c2w.squeeze(), self.decoders)
 
             else:
                 if self.const_speed_assumption and idx - 2 >= 0:
@@ -302,7 +244,7 @@ class Tracker(object):
                 for cam_iter in range(self.num_cam_iters):
                     cam_pose = torch.cat([R, T], -1)
 
-                    self.visualizer.save_imgs(idx, cam_iter, gt_depth, gt_color, cam_pose, all_planes, self.decoders)
+                    self.visualizer.save_imgs(idx, cam_iter, gt_depth, gt_color, cam_pose, self.decoders)
 
                     loss = self.optimize_tracking(cam_pose, gt_color, gt_depth, self.tracking_pixels, optimizer_camera, gt_semantic)
                     if loss < current_min_loss:

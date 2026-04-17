@@ -118,13 +118,12 @@ class Mesher(object):
         return_mesh = trimesh.Trimesh(vertices=points, faces=faces)
         return return_mesh
 
-    def eval_points(self, p, all_planes, decoders, color=False, semantic=False):
+    def eval_points(self, p, decoders, color=False, semantic=False):
         """
         Evaluates the TSDF and/or color value for the points.
         Args:
             p (torch.Tensor): points to be evaluated, shape (N, 3).
-            all_planes (Tuple): all feature planes.
-            decoders (torch.nn.Module): decoders for TSDF and color.
+            decoders (nn.Module): decoders with embedded hash fields.
         Returns:
             ret (torch.Tensor): the evaluation result, shape (N, 4).
         """
@@ -140,7 +139,7 @@ class Mesher(object):
             mask_z = (pi[:, 2] < bound[2][1]) & (pi[:, 2] > bound[2][0])
             mask = mask_x & mask_y & mask_z
 
-            ret, _ = decoders(pi, all_planes=all_planes)    # [N,3+1+num_classes]
+            ret, _ = decoders(pi)    # [N,3+1+num_classes]
 
             ret[~mask, 3] = -1
             if color:
@@ -186,13 +185,12 @@ class Mesher(object):
 
         return {"grid_points": grid_points_t, "xyz": [x, y, z]}
 
-    def get_mesh(self, mesh_out_color, all_planes, decoders, keyframe_dict, device='cuda:0', mesh_out_semantic=None, color=True, semantic=True):
+    def get_mesh(self, mesh_out_color, decoders, keyframe_dict, device='cuda:0', mesh_out_semantic=None, color=True, semantic=True):
         """
         Get mesh from keyframes and feature planes and save to file.
         Args:
             mesh_out_file (str): output mesh file.
-            all_planes (Tuple): all feature planes.
-            decoders (torch.nn.Module): decoders for TSDF and color.
+            decoders (nn.Module): decoders with embedded hash fields.
             keyframe_dict (dict): keyframe dictionary.
             device (str): device to run the model.
             color (bool): whether to use color.
@@ -220,7 +218,7 @@ class Mesher(object):
 
             print(f'\nMeshing [3/4]: evaluating TSDF...')
             for i, pnts in enumerate(torch.split(points, self.points_batch_size, dim=0)):
-                z.append(self.eval_points(pnts.to(device), all_planes, decoders, color=True).cpu().numpy()[:, 3])
+                z.append(self.eval_points(pnts.to(device), decoders, color=True).cpu().numpy()[:, 3])
                 print(f'  batch {i+1}/{n_batches}', end='\r')
             z = np.concatenate(z, axis=0)
             print()
@@ -265,7 +263,7 @@ class Mesher(object):
                 points = torch.from_numpy(vertices)
                 z = []
                 for i, pnts in enumerate(torch.split(points, self.points_batch_size, dim=0)):
-                    z_color = self.eval_points(pnts.to(device).float(), all_planes, decoders, color=True).cpu()[..., :3]
+                    z_color = self.eval_points(pnts.to(device).float(), decoders, color=True).cpu()[..., :3]
                     z.append(z_color)
                 z = torch.cat(z, dim=0)
                 vertex_colors = z.numpy()
@@ -274,7 +272,7 @@ class Mesher(object):
                 points = torch.from_numpy(vertices)
                 z = []
                 for i, pnts in enumerate(torch.split(points, self.points_batch_size, dim=0)):
-                    z_semantic = self.eval_points(pnts.to(device).float(), all_planes, decoders, semantic=True).cpu()[..., :3]
+                    z_semantic = self.eval_points(pnts.to(device).float(), decoders, semantic=True).cpu()[..., :3]
                     z.append(z_semantic)
                 z = torch.cat(z, dim=0)
                 vertex_semantic = z.numpy()

@@ -39,19 +39,7 @@ class Mapper(object):
         self.mapping_cnt = sni.mapping_cnt
         self.decoders = sni.shared_decoders
 
-        self.planes_xy = sni.shared_planes_xy
-        self.planes_xz = sni.shared_planes_xz
-        self.planes_yz = sni.shared_planes_yz
-
-        self.c_planes_xy = sni.shared_c_planes_xy
-        self.c_planes_xz = sni.shared_c_planes_xz
-        self.c_planes_yz = sni.shared_c_planes_yz
-
         self.use_gt_semantic = cfg['func']['use_gt_semantic']
-
-        self.s_planes_xy = sni.shared_s_planes_xy
-        self.s_planes_xz = sni.shared_s_planes_xz
-        self.s_planes_yz = sni.shared_s_planes_yz
 
         self.estimate_c2w_list = sni.estimate_c2w_list
         self.mapping_first_frame = sni.mapping_first_frame
@@ -213,9 +201,6 @@ class Mapper(object):
 
     def optimize_mapping(self, iters, lr_factor, idx, cur_gt_color, cur_gt_depth, gt_cur_c2w, cur_sem_feat,
                          cur_sem_label, gt_label, keyframe_dict, keyframe_list, cur_c2w):
-        all_planes = (self.planes_xy, self.planes_xz, self.planes_yz,
-                      self.c_planes_xy, self.c_planes_xz, self.c_planes_yz,
-                      self.s_planes_xy, self.s_planes_xz, self.s_planes_yz)
         H, W, fx, fy, cx, cy = self.H, self.W, self.fx, self.fy, self.cx, self.cy
         cfg = self.cfg
         device = self.device
@@ -236,29 +221,11 @@ class Mapper(object):
 
         pixs_per_image = self.mapping_pixels//len(optimize_frame)
 
-        decoders_para_list = []
-        decoders_para_list += list(self.decoders.parameters())
-
-        planes_para = []
-        for planes in [self.planes_xy, self.planes_xz, self.planes_yz]:
-            for i, plane in enumerate(planes):
-                plane = nn.Parameter(plane)
-                planes_para.append(plane)
-                planes[i] = plane
-
-        c_planes_para = []
-        for c_planes in [self.c_planes_xy, self.c_planes_xz, self.c_planes_yz]:
-            for i, c_plane in enumerate(c_planes):
-                c_plane = nn.Parameter(c_plane)
-                c_planes_para.append(c_plane)
-                c_planes[i] = c_plane
-
-        s_planes_para = []
-        for s_planes in [self.s_planes_xy, self.s_planes_xz, self.s_planes_yz]:
-            for i, s_plane in enumerate(s_planes):
-                s_plane = nn.Parameter(s_plane)
-                s_planes_para.append(s_plane)
-                s_planes[i] = s_plane
+        hash_sdf_para = list(self.decoders.hash_sdf.parameters())
+        hash_color_para = list(self.decoders.hash_color.parameters())
+        hash_sem_para = list(self.decoders.hash_semantic.parameters())
+        hash_param_ids = {id(p) for p in hash_sdf_para + hash_color_para + hash_sem_para}
+        decoders_para_list = [p for p in self.decoders.parameters() if id(p) not in hash_param_ids]
 
         gt_depths = []
         gt_colors = []
@@ -304,38 +271,32 @@ class Mapper(object):
         kf_rgb_feats = torch.stack(kf_rgb_feats, dim=0)
         kf_gt_label = torch.stack(kf_gt_label, dim=0)
 
+        hash_lr = cfg['mapping']['lr']['hash_lr'] * lr_factor
+        decoders_lr = cfg['mapping']['lr']['decoders_lr'] * lr_factor
+
+        model_paras = [
+            {'params': decoders_para_list, 'lr': decoders_lr},
+            {'params': hash_sdf_para, 'lr': hash_lr},
+            {'params': hash_color_para, 'lr': hash_lr},
+            {'params': hash_sem_para, 'lr': hash_lr},
+        ]
+
         if self.joint_opt:
             cam_poses = nn.Parameter(matrix_to_cam_pose(c2ws[1:]))
+            model_paras.append({'params': [cam_poses], 'lr': self.joint_opt_cam_lr})
 
-            model_paras = [{'params': decoders_para_list, 'lr': 0},
-                           {'params': planes_para, 'lr': 0},
-                           {'params': c_planes_para, 'lr': 0},
-                           {'params': [cam_poses], 'lr': 0}]
-
-        else:
-            model_paras = [{'params': decoders_para_list, 'lr': 0},
-                           {'params': planes_para, 'lr': 0},
-                           {'params': c_planes_para, 'lr': 0}]
-
-        model_paras.append({'params': s_planes_para, 'lr': 5e-3})
         model_paras.append({'params': self.model_manager.encoder.parameters(), 'lr': 3e-3})
         model_paras.append({'params': self.model_manager.head.parameters(), 'lr': 3e-3})
         model_paras.append({'params': self.model_manager.feat_fusion.parameters(), 'lr': cfg['mapping']['lr']['fusion_lr']})
 
         optimizer = torch.optim.Adam(model_paras)
-        optimizer.param_groups[0]['lr'] = cfg['mapping']['lr']['decoders_lr'] * lr_factor
-        optimizer.param_groups[1]['lr'] = cfg['mapping']['lr']['planes_lr'] * lr_factor
-        optimizer.param_groups[2]['lr'] = cfg['mapping']['lr']['c_planes_lr'] * lr_factor
-
-        if self.joint_opt:
-            optimizer.param_groups[3]['lr'] = self.joint_opt_cam_lr
 
         for joint_iter in range(iters):
             if self.verbose:
                 start_time = time.time()
 
             if (not (idx == 0 and self.no_vis_on_first_frame)):
-                self.visualizer.save_imgs(idx, joint_iter, cur_gt_depth, cur_gt_color, cur_c2w, all_planes, self.decoders,
+                self.visualizer.save_imgs(idx, joint_iter, cur_gt_depth, cur_gt_color, cur_c2w, self.decoders,
                                           gt_sem=gt_label, est_sem=cur_sem_label)
 
             if self.joint_opt:
@@ -348,7 +309,7 @@ class Mapper(object):
                 0, H, 0, W, pixs_per_image, H, W, fx, fy, cx, cy, c2ws_, gt_depths, gt_colors,
                 sem_feats=kf_sem_feats, rgb_feats=kf_rgb_feats, gt_label=kf_gt_label, device=device, dim=self.c_dim)
 
-            depth, color, sdf, z_vals, gt_feat, plane_feat, render_semantic = self.renderer.render_batch_ray(all_planes, self.decoders,
+            depth, color, sdf, z_vals, gt_feat, plane_feat, render_semantic = self.renderer.render_batch_ray(self.decoders,
                                                             batch_rays_d, batch_rays_o, device, self.truncation, gt_depth=batch_gt_depth,
                                                             sem_feats=batch_sem_feats, rgb_feats=batch_rgb_feats,
                                                             return_emb=True)
@@ -423,11 +384,6 @@ class Mapper(object):
 
     def run(self):
         cfg = self.cfg
-
-        all_planes = (
-            self.planes_xy, self.planes_xz, self.planes_yz,
-            self.c_planes_xy, self.c_planes_xz, self.c_planes_yz,
-            self.s_planes_xy, self.s_planes_xz, self.s_planes_yz)
 
         idx, gt_color, gt_depth, gt_c2w, gt_semantic = self.frame_reader[0]
         data_iterator = iter(self.frame_loader)
@@ -518,12 +474,12 @@ class Mapper(object):
                 # cull_mesh(mesh_out_file, self.cfg, self.args, self.device, estimate_c2w_list=self.estimate_c2w_list[:idx+1])
                 mesh_out_semantic = f'{self.output}/mesh/{idx:05d}_mesh_sem.ply'
                 mesh_out_color = f'{self.output}/mesh/{idx:05d}_mesh_rgb.ply'
-                self.mesher.get_mesh(mesh_out_color, all_planes, self.decoders, self.keyframe_dict, self.device, mesh_out_semantic=mesh_out_semantic, color=False)
+                self.mesher.get_mesh(mesh_out_color, self.decoders, self.keyframe_dict, self.device, mesh_out_semantic=mesh_out_semantic, color=False)
 
             if idx == self.n_img-1:
                 mesh_out_semantic = f'{self.output}/mesh/final_mesh_semantic.ply'
                 mesh_out_color = f'{self.output}/mesh/final_mesh_color.ply'
-                self.mesher.get_mesh(mesh_out_color, all_planes, self.decoders, self.keyframe_dict, self.device, mesh_out_semantic=mesh_out_semantic, semantic=False)
+                self.mesher.get_mesh(mesh_out_color, self.decoders, self.keyframe_dict, self.device, mesh_out_semantic=mesh_out_semantic, semantic=False)
                 cull_mesh(mesh_out_color, self.cfg, self.args, self.device, estimate_c2w_list=self.estimate_c2w_list)
 
                 break

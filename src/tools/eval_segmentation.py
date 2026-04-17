@@ -3,7 +3,7 @@ import sys
 sys.path.append('.')
 
 import torch, argparse, os
-from src.common import get_rays, sample_pdf, normalize_3d_coordinate
+from src.common import get_rays, sample_pdf
 from src import config
 import numpy as np
 from src.utils.datasets import get_dataset
@@ -33,14 +33,11 @@ class Eval_Segmentation():
 
     def load_bound(self, cfg):
         self.bound = torch.from_numpy(np.array(cfg['mapping']['bound'])*self.scale).float().to(self.device)
-        bound_dividable = cfg['planes_res']['bound_dividable']
-        self.bound[:, 1] = (((self.bound[:, 1]-self.bound[:, 0]) /
-                            bound_dividable).int()+1)*bound_dividable+self.bound[:, 0]
 
     def sdf2alpha(self, sdf, beta=10):
         return 1. - torch.exp(-beta * torch.sigmoid(-sdf * beta))
 
-    def render_img(self, all_planes, decoders, c2w, truncation, device, gt_depth=None):
+    def render_img(self, decoders, c2w, truncation, device, gt_depth=None):
         with torch.no_grad():
             H = self.H
             W = self.W
@@ -58,7 +55,7 @@ class Eval_Segmentation():
                 rays_d_batch = rays_d[i:i + ray_batch_size]
                 rays_o_batch = rays_o[i:i + ray_batch_size]
                 gt_depth_batch = gt_depth[i:i + ray_batch_size]
-                semantic, rgb = self.render_batch_ray(all_planes, decoders, rays_d_batch, rays_o_batch,
+                semantic, rgb = self.render_batch_ray(decoders, rays_d_batch, rays_o_batch,
                                             device, truncation, gt_depth=gt_depth_batch)
                 semantic_list.append(semantic)
                 rgb_list.append(rgb)
@@ -150,7 +147,7 @@ class Eval_Segmentation():
         rgb = np.stack([r, g, b], axis=2)
         return rgb.astype(np.float32) / 255.0
 
-    def render_batch_ray(self, all_planes, decoders, rays_d, rays_o, device, truncation, gt_depth=None):
+    def render_batch_ray(self, decoders, rays_d, rays_o, device, truncation, gt_depth=None):
         n_stratified = self.n_stratified
         n_importance = self.n_importance
         n_rays = rays_o.shape[0]
@@ -194,8 +191,7 @@ class Eval_Segmentation():
                     z_vals_uni = self.perturbation(z_vals_uni)
                 pts_uni = rays_o_uni.unsqueeze(1) + rays_d_uni.unsqueeze(1) * z_vals_uni.unsqueeze(-1)  # [n_rays, n_stratified, 3]
 
-                pts_uni_nor = normalize_3d_coordinate(pts_uni.clone(), self.bound)
-                sdf_uni, _ = decoders.get_raw_sdf(pts_uni_nor, all_planes[:6])
+                sdf_uni, _ = decoders.get_raw_sdf(pts_uni)
                 sdf_uni = sdf_uni.reshape(*pts_uni.shape[0:2])
                 alpha_uni = self.sdf2alpha(sdf_uni, decoders.beta)
                 weights_uni = alpha_uni * torch.cumprod(torch.cat([torch.ones((alpha_uni.shape[0], 1), device=device)
@@ -209,7 +205,7 @@ class Eval_Segmentation():
         pts = rays_o[..., None, :] + rays_d[..., None, :] * \
               z_vals[..., :, None]  # [n_rays, n_stratified+n_importance, 3]
 
-        raw, plane_feat = decoders(pts, all_planes)
+        raw, plane_feat = decoders(pts)
 
         semantic_alpha = self.sdf2alpha(raw[..., 3], decoders.semantic_beta)
         semantic_weights = semantic_alpha * torch.cumprod(
@@ -280,36 +276,16 @@ if __name__ == '__main__':
             print('Get ckpt :', ckpt_path)
             ckpt = torch.load(ckpt_path, map_location=device)
 
-            model = config.get_model(cfg)
+            model = config.get_model(cfg, eval.bound.cpu())
             model.load_state_dict(ckpt['decoder_state_dict'])
-            model.bound = eval.bound
             model.to(device)
 
-            # c2w_list = ckpt['estimate_c2w_list']
-
-            s_planes_xy = ckpt['s_planes_xy']
-            s_planes_xz = ckpt['s_planes_xz']
-            s_planes_yz = ckpt['s_planes_yz']
-
-            planes_xy = ckpt['planes_xy']
-            planes_xz = ckpt['planes_xz']
-            planes_yz = ckpt['planes_yz']
-
-            c_planes_xy = ckpt['c_planes_xy']
-            c_planes_xz = ckpt['c_planes_xz']
-            c_planes_yz = ckpt['c_planes_yz']
-
-            all_planes = (planes_xy, planes_xz, planes_yz, c_planes_xy, c_planes_xz, c_planes_yz,
-                            s_planes_xy, s_planes_xz, s_planes_yz)
-            # print(len(c2w_list))
-            # for i in range(0, 200, 5):
             id = 0
             _, gt_color, gt_depth, _, semantic_data = frame_reader[id]
-            # gt_semantic = torch.from_numpy(semantic_data)
             gt_semantic = semantic_data.to(device)
             gt_depth = gt_depth.to(device)
 
-            semantic, rgb = eval.render_img(all_planes, model, c2w_list[id].to(device), truncation, device, gt_depth=gt_depth)
+            semantic, rgb = eval.render_img(model, c2w_list[id].to(device), truncation, device, gt_depth=gt_depth)
             eval.visualize(id, semantic, gt_semantic, rgb, gt_color)
 
             avg_pixAcc = sum(all_pixAccs) / len(all_pixAccs)

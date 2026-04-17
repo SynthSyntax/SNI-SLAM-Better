@@ -4,16 +4,18 @@ device: "cuda:0"
 keyframe_device: "cpu" # Change this to "cpu" to reduce GPU memory usage
 feature_device: "cpu"
 
-planes_res:
-  coarse: 0.24
-  fine: 0.06
-  bound_dividable: 0.24
-c_planes_res:
-  coarse: 0.24
-  fine: 0.03
-s_planes_res:
-  coarse: 0.24
-  fine: 0.03
+hash_encoding:
+  n_features_per_level: 2    # F: features per hash-grid level
+  log2_hashmap_size: 19      # T = 2^19 entries per level table
+  base_resolution: 16        # coarsest voxel resolution
+  finest_resolution: 2048    # finest voxel resolution (drives n_levels via c_dim)
+  # per-field overrides (optional — omit to use defaults above)
+  sdf:
+    finest_resolution: 2048
+  color:
+    finest_resolution: 2048
+  semantic:
+    finest_resolution: 1024  # semantic is a smoother signal; smaller grid suffices
 
 meshing:
   level_set: 0
@@ -66,8 +68,8 @@ mapping:
   w_semantic: 0.1
   lr:
     decoders_lr: 0.001
-    planes_lr: 0.005
-    c_planes_lr: 0.005
+    hash_lr: 0.01           # hash tables converge best at ~10x MLP rate
+    fusion_lr: 0.001
 cam:
   H: 680
   W: 1200

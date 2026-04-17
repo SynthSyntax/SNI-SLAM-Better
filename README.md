@@ -19,12 +19,49 @@ Siting Zhu*, Guangming Wang*, Hermann Blum, Jiuming Liu, Liang Song, Marc Pollef
 
 This repo uses [pixi](https://pixi.sh) for dependency management (Python 3.14, PyTorch, CUDA 12).
 
-```bash
-# Install pixi if you don't have it
-curl -fsSL https://pixi.sh/install.sh | bash
+**Requirements:** Linux, CUDA-capable GPU (driver ≥ 12.2).
 
-# Install all dependencies
-pixi install
+### 1. Install pixi
+
+```bash
+curl -fsSL https://pixi.sh/install.sh | bash
+source ~/.bashrc   # or open a new terminal
+```
+
+### 2. Install conda dependencies
+
+```bash
+CONDA_OVERRIDE_CUDA=12.2 pixi install
+```
+
+The `CONDA_OVERRIDE_CUDA` override is required because pixi checks for a CUDA driver virtual package that may not be visible on login/compute nodes. Set the value to match your installed driver (`nvidia-smi` → top-right corner).
+
+### 3. Install tiny-cuda-nn
+
+[tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn) is a CUDA extension that must be compiled from source. It cannot be resolved through pixi, so install it once with:
+
+```bash
+CONDA_OVERRIDE_CUDA=12.2 pixi run install-tcnn
+```
+
+This task sets all required env vars automatically. It compiles for **SM 89 (L40S / RTX 4090)**. For a different GPU, pass the matching architecture:
+
+| GPU | Architecture |
+|-----|-------------|
+| A100 | `80` |
+| A6000 / RTX 3090 | `86` |
+| L40S / RTX 4090 | `89` |
+| H100 | `90` |
+
+```bash
+# Example for A100
+TCNN_CUDA_ARCHITECTURES=80 CONDA_OVERRIDE_CUDA=12.2 pixi run install-tcnn
+```
+
+### 4. Verify the installation
+
+```bash
+pixi run python -c "import tinycudann as tcnn, torch; print('tcnn OK')"
 ```
 
 > **Note:** The original repo used conda + `environment.yaml` targeting Python 3.7 and CUDA 11.3. This version has been updated to use pixi with a modern stack (Python 3.14, CUDA 12+). The `environment.yaml` is kept for reference but is not used.
@@ -36,7 +73,7 @@ pixi install
 
 Run SNI-SLAM:
 ```bash
-pixi run python -W ignore run.py configs/Replica/room1.yaml
+CONDA_OVERRIDE_CUDA=12.2 pixi run python run.py configs/Replica/room1.yaml
 ```
 The mesh for evaluation is saved as `$OUTPUT_FOLDER/mesh/final_mesh_eval_rec_culled.ply`
 

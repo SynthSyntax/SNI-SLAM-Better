@@ -7,9 +7,11 @@ __pycache__/
 *.pyc
 *.pyo
 
+#logs
 wandb/
+*.log
 
-#data and output folders
+#data/output
 data/
 seg/
 output/
@@ -17,3 +19,8 @@ output.zip
 
 #Slurm Scripts
 Slurm*
+*.sh
+
+#test scripts
+test.py
+

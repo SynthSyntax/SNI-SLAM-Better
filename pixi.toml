@@ -5,7 +5,7 @@ platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
-install-tcnn = { cmd = "TCNN_CUDA_ARCHITECTURES=89 LD_LIBRARY_PATH=$CONDA_PREFIX/targets/x86_64-linux/lib:$LD_LIBRARY_PATH python -m pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch --no-build-isolation" }
+install-tcnn = { cmd = "LD_LIBRARY_PATH=$CONDA_PREFIX/targets/x86_64-linux/lib:$LD_LIBRARY_PATH python -m pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch --no-build-isolation" }
 run = { cmd = "python run.py" }
 
 [system-requirements]

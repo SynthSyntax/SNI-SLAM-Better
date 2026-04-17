@@ -44,19 +44,7 @@ The `CONDA_OVERRIDE_CUDA` override is required because pixi checks for a CUDA dr
 CONDA_OVERRIDE_CUDA=12.2 pixi run install-tcnn
 ```
 
-This task sets all required env vars automatically. It compiles for **SM 89 (L40S / RTX 4090)**. For a different GPU, pass the matching architecture:
-
-| GPU | Architecture |
-|-----|-------------|
-| A100 | `80` |
-| A6000 / RTX 3090 | `86` |
-| L40S / RTX 4090 | `89` |
-| H100 | `90` |
-
-```bash
-# Example for A100
-TCNN_CUDA_ARCHITECTURES=80 CONDA_OVERRIDE_CUDA=12.2 pixi run install-tcnn
-```
+This task sets all required env vars automatically. It auto-detects your GPU's compute capability at compile time, so it works on any NVIDIA GPU.
 
 ### 4. Verify the installation
 

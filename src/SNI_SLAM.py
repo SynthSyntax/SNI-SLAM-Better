@@ -81,6 +81,8 @@ class SNI_SLAM():
         self.mapping_idx.share_memory_()
         self.mapping_cnt = torch.zeros((1)).int()  # counter for mapping
         self.mapping_cnt.share_memory_()
+        self.mapping_done = torch.zeros((1)).int()  # set to 1 by mapper after meshing
+        self.mapping_done.share_memory_()
 
         self.shared_decoders = self.shared_decoders.to(self.device)
         self.shared_decoders.share_memory()

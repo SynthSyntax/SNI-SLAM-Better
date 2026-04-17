@@ -95,6 +95,13 @@ class Mapper(object):
 
         self.H, self.W, self.fx, self.fy, self.cx, self.cy = sni.H, sni.W, sni.fx, sni.fy, sni.cx, sni.cy
 
+        # Persistent optimizer — keeps Adam momentum/variance across frames
+        self._optimizer = None
+        self._optimizer_lr_factor = None
+
+        # Cached loss — avoids allocating a new object every inner iteration
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
+
 
     def sdf_losses(self, sdf, z_vals, gt_depth):
         """
@@ -131,6 +138,30 @@ class Mapper(object):
         sdf_losses = self.w_sdf_fs * fs_loss + self.w_sdf_center * center_loss + self.w_sdf_tail * tail_loss
 
         return sdf_losses
+
+    def _build_model_optimizer(self, lr_factor):
+        """
+        Build the persistent scene optimizer (hash grids + MLPs + model_manager).
+        Called once on the first frame and again only if lr_factor changes (once,
+        at the init→normal phase transition), so Adam state is preserved across frames.
+        """
+        cfg = self.cfg
+        hash_sdf_para = list(self.decoders.hash_sdf.parameters())
+        hash_color_para = list(self.decoders.hash_color.parameters())
+        hash_sem_para = list(self.decoders.hash_semantic.parameters())
+        hash_param_ids = {id(p) for p in hash_sdf_para + hash_color_para + hash_sem_para}
+        decoders_para_list = [p for p in self.decoders.parameters() if id(p) not in hash_param_ids]
+
+        self._optimizer = torch.optim.Adam([
+            {'params': decoders_para_list,                              'lr': cfg['mapping']['lr']['decoders_lr'] * lr_factor},
+            {'params': hash_sdf_para,                                   'lr': cfg['mapping']['lr']['hash_lr'] * lr_factor},
+            {'params': hash_color_para,                                 'lr': cfg['mapping']['lr']['hash_lr'] * lr_factor},
+            {'params': hash_sem_para,                                   'lr': cfg['mapping']['lr']['hash_lr'] * lr_factor},
+            {'params': self.model_manager.encoder.parameters(),        'lr': 3e-3},
+            {'params': self.model_manager.head.parameters(),           'lr': 3e-3},
+            {'params': self.model_manager.feat_fusion.parameters(),    'lr': cfg['mapping']['lr']['fusion_lr']},
+        ])
+        self._optimizer_lr_factor = lr_factor
 
     def keyframe_selection_overlap(self, gt_color, gt_depth, c2w, num_keyframes, num_samples=8, num_rays=50):
         """
@@ -221,11 +252,10 @@ class Mapper(object):
 
         pixs_per_image = self.mapping_pixels//len(optimize_frame)
 
-        hash_sdf_para = list(self.decoders.hash_sdf.parameters())
-        hash_color_para = list(self.decoders.hash_color.parameters())
-        hash_sem_para = list(self.decoders.hash_semantic.parameters())
-        hash_param_ids = {id(p) for p in hash_sdf_para + hash_color_para + hash_sem_para}
-        decoders_para_list = [p for p in self.decoders.parameters() if id(p) not in hash_param_ids]
+        # Reuse persistent optimizer; rebuild only when lr_factor changes (once per run)
+        if self._optimizer_lr_factor != lr_factor:
+            self._build_model_optimizer(lr_factor)
+        optimizer = self._optimizer
 
         gt_depths = []
         gt_colors = []
@@ -271,25 +301,13 @@ class Mapper(object):
         kf_rgb_feats = torch.stack(kf_rgb_feats, dim=0)
         kf_gt_label = torch.stack(kf_gt_label, dim=0)
 
-        hash_lr = cfg['mapping']['lr']['hash_lr'] * lr_factor
-        decoders_lr = cfg['mapping']['lr']['decoders_lr'] * lr_factor
-
-        model_paras = [
-            {'params': decoders_para_list, 'lr': decoders_lr},
-            {'params': hash_sdf_para, 'lr': hash_lr},
-            {'params': hash_color_para, 'lr': hash_lr},
-            {'params': hash_sem_para, 'lr': hash_lr},
-        ]
-
+        # Separate lightweight optimizer for camera poses (re-initialized each frame anyway)
+        cam_poses = None
+        cam_optimizer = None
         if self.joint_opt:
             cam_poses = nn.Parameter(matrix_to_cam_pose(c2ws[1:]))
-            model_paras.append({'params': [cam_poses], 'lr': self.joint_opt_cam_lr})
-
-        model_paras.append({'params': self.model_manager.encoder.parameters(), 'lr': 3e-3})
-        model_paras.append({'params': self.model_manager.head.parameters(), 'lr': 3e-3})
-        model_paras.append({'params': self.model_manager.feat_fusion.parameters(), 'lr': cfg['mapping']['lr']['fusion_lr']})
-
-        optimizer = torch.optim.Adam(model_paras)
+            cam_optimizer = torch.optim.Adam(
+                [{'params': [cam_poses], 'lr': self.joint_opt_cam_lr}])
 
         for joint_iter in range(iters):
             if self.verbose:
@@ -299,7 +317,7 @@ class Mapper(object):
                 self.visualizer.save_imgs(idx, joint_iter, cur_gt_depth, cur_gt_color, cur_c2w, self.decoders,
                                           gt_sem=gt_label, est_sem=cur_sem_label)
 
-            if self.joint_opt:
+            if self.joint_opt and cam_poses is not None:
                 ## We fix the oldest c2w to avoid drifting
                 c2ws_ = torch.cat([c2ws[0:1], cam_pose_to_matrix(cam_poses)], dim=0)
             else:
@@ -333,13 +351,16 @@ class Mapper(object):
             feature_loss = self.w_feature * (gt_feature - plane_feature).abs().mean()
             loss = loss + feature_loss
 
-            CrossEntropyLoss = nn.CrossEntropyLoss(ignore_index=-1)
-            semantic_loss = self.w_semantic * CrossEntropyLoss(render_semantic, batch_gt_label)
+            semantic_loss = self.w_semantic * self.ce_loss(render_semantic, batch_gt_label)
             loss = loss + semantic_loss
 
             optimizer.zero_grad()
+            if cam_optimizer is not None:
+                cam_optimizer.zero_grad()
             loss.backward(retain_graph=False)
             optimizer.step()
+            if cam_optimizer is not None:
+                cam_optimizer.step()
 
             if self.verbose:
                 end_time = time.time()
@@ -372,14 +393,10 @@ class Mapper(object):
         return cur_c2w
 
     def add_noise(self, gt_sem_label, noise_ratio):
-        h,w = gt_sem_label.shape
         noise_label = gt_sem_label.clone()
-        import random
-        num_classes = self.n_classes
-        for i in range(h):
-            for j in range(w):
-                if random.random() < noise_ratio:
-                    noise_label[i, j] = random.randint(0, num_classes - 1)
+        mask = torch.rand(noise_label.shape, device=noise_label.device) < noise_ratio
+        noise_label[mask] = torch.randint(0, self.n_classes, (mask.sum().item(),),
+                                          device=noise_label.device)
         return noise_label
 
     def run(self):
@@ -481,7 +498,7 @@ class Mapper(object):
                 mesh_out_color = f'{self.output}/mesh/final_mesh_color.ply'
                 self.mesher.get_mesh(mesh_out_color, self.decoders, self.keyframe_dict, self.device, mesh_out_semantic=mesh_out_semantic, semantic=False)
                 cull_mesh(mesh_out_color, self.cfg, self.args, self.device, estimate_c2w_list=self.estimate_c2w_list)
-
+                self.mapping_done[0] = 1  # signal tracker it's safe to exit
                 break
 
             if idx == self.n_img-1:

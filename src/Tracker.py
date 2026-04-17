@@ -29,6 +29,7 @@ class Tracker(object):
         self.gt_c2w_list = sni.gt_c2w_list
         self.mapping_idx = sni.mapping_idx
         self.mapping_cnt = sni.mapping_cnt
+        self.mapping_done = sni.mapping_done
         self.shared_decoders = sni.shared_decoders
         self.estimate_c2w_list = sni.estimate_c2w_list
         self.truncation = sni.truncation
@@ -257,3 +258,7 @@ class Tracker(object):
             self.gt_c2w_list[idx] = gt_c2w.squeeze(0).clone()
             pre_c2w = c2w.clone()
             self.idx[0] = idx
+
+        # Wait for mapper to finish meshing before releasing shared CUDA memory
+        while self.mapping_done[0] == 0:
+            time.sleep(1)

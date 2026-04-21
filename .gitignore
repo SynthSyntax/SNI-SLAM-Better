@@ -14,8 +14,8 @@ wandb/
 #data/output
 data/
 seg/
-output/
-output.zip
+output*
+results/
 
 #Slurm Scripts
 Slurm*

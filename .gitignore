@@ -12,4 +12,8 @@ wandb/
 #data and output folders
 data/
 seg/
-output/
+output*
+results*
+
+#testing
+test*

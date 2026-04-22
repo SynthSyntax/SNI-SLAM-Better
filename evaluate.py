@@ -279,7 +279,7 @@ def main():
     # ── 5. Save JSON ──────────────────────────────────────────────────────
     os.makedirs('results', exist_ok=True)
     scene_tag = os.path.basename(args.config).replace('.yaml', '')
-    out_path  = f'results/eval_{scene_tag}.json'
+    out_path  = f'results/eval_{scene_tag}_planes.json'
 
     def _serial(obj):
         if isinstance(obj, dict):    return {k: _serial(v) for k, v in obj.items()}

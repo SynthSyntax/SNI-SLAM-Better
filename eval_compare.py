@@ -69,12 +69,38 @@ def eval_mesh_3d(output_dir, gt_mesh_path):
     }
 
 
-def load_bench(output_dir):
-    path = os.path.join(output_dir, 'benchmark_results.json')
-    if not os.path.exists(path):
+def load_eval(output_dir, label):
+    """Load results/eval_*.json produced by evaluate.py.
+
+    Search order:
+      1. results/eval_<label>.json          (exact label match)
+      2. any results/eval_*.json containing the label in its stem
+      3. results/eval_<scene>.json          (scene = second-to-last path component)
+    """
+    results_dir = 'results'
+    if not os.path.isdir(results_dir):
         return None
-    with open(path) as f:
-        return json.load(f)
+
+    # exact match
+    exact = os.path.join(results_dir, f'eval_{label}.json')
+    if os.path.exists(exact):
+        with open(exact) as f:
+            return json.load(f)
+
+    # scan for any file whose stem contains the label
+    for fname in sorted(os.listdir(results_dir)):
+        if fname.endswith('.json') and fname.startswith('eval_') and label in fname:
+            with open(os.path.join(results_dir, fname)) as f:
+                return json.load(f)
+
+    # fall back to scene name derived from path
+    scene = os.path.basename(os.path.dirname(output_dir.rstrip('/')))
+    scene_path = os.path.join(results_dir, f'eval_{scene}.json')
+    if os.path.exists(scene_path):
+        with open(scene_path) as f:
+            return json.load(f)
+
+    return None
 
 
 def fmt(v, decimals=3):
@@ -106,7 +132,8 @@ def print_section(title, rows, labels):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--runs',    nargs='+', required=True)
-    parser.add_argument('--configs', nargs='+', required=True)
+    parser.add_argument('--configs', nargs='+', default=[],
+                        help='Optional: label:config.yaml pairs to get scale. Defaults to scale=1.')
     parser.add_argument('--gt_mesh', default=None)
     args = parser.parse_args()
 
@@ -116,7 +143,11 @@ def main():
     if len(labels) != 2:
         print("Exactly 2 runs required."); sys.exit(1)
     la, lb = labels
-    cfgs = {k: config.load_config(v, 'configs/SNI-SLAM.yaml') for k, v in cfg_map.items()}
+
+    def get_scale(label):
+        if label in cfg_map:
+            return config.load_config(cfg_map[label], 'configs/SNI-SLAM.yaml')['scale']
+        return 1.0
 
     print()
     print("=" * 80)
@@ -125,8 +156,8 @@ def main():
     print(f"  {la}: {runs[la]}")
     print(f"  {lb}: {runs[lb]}")
 
-    ate_a = eval_ate(runs[la], cfgs[la]['scale'])
-    ate_b = eval_ate(runs[lb], cfgs[lb]['scale'])
+    ate_a = eval_ate(runs[la], get_scale(la))
+    ate_b = eval_ate(runs[lb], get_scale(lb))
     print_section("Tracking -- ATE (lower is better)", [
         ("ATE RMSE (cm)",   ate_a and ate_a['ate_rmse_cm'],   ate_b and ate_b['ate_rmse_cm'],   3, True),
         ("ATE mean (cm)",   ate_a and ate_a['ate_mean_cm'],   ate_b and ate_b['ate_mean_cm'],   3, True),
@@ -144,26 +175,31 @@ def main():
     else:
         print("\n  -- Reconstruction -- (skipped: no --gt_mesh)")
 
-    ba = load_bench(runs[la])
-    bb = load_bench(runs[lb])
+    ba = load_eval(runs[la], la)
+    bb = load_eval(runs[lb], lb)
     if ba and bb:
         ea, eb = ba['estimates'], bb['estimates']
         ma, mb = ba['memory'],    bb['memory']
         pa, pb = ba['params'],    bb['params']
+        # encoder key differs: hash uses 'hash_grids', planes uses 'feature_planes'
+        enc_a = pa.get('hash_grids') or pa.get('feature_planes') or 0
+        enc_b = pb.get('hash_grids') or pb.get('feature_planes') or 0
+        enc_label_a = 'hash grids' if 'hash_grids' in pa else 'feature planes'
+        enc_label_b = 'hash grids' if 'hash_grids' in pb else 'feature planes'
         print_section("Speed (lower is better)", [
             ("Mapping per frame (ms)",   ea['mapping_per_frame_ms'],   eb['mapping_per_frame_ms'],   1, True),
             ("Tracking per frame (ms)",  ea['tracking_per_frame_ms'],  eb['tracking_per_frame_ms'],  1, True),
             ("Effective per frame (ms)", ea['effective_per_frame_ms'], eb['effective_per_frame_ms'], 1, True),
-            ("Est. total run (min)",     ea['est_total_min'],           eb['est_total_min'],           1, True),
+            ("Est. total run (min)",     ea['est_total_min'],          eb['est_total_min'],          1, True),
         ], (la, lb))
         print_section("Memory & Model size", [
-            ("Peak GPU memory (MB)", ma['peak_mb'],  mb['peak_mb'],  1, True),
-            ("Encoder params",       pa['total'] - pa.get('mlps', 0), pb['total'] - pb.get('mlps', 0), 0, False),
-            ("MLP params",           pa.get('mlps', 0), pb.get('mlps', 0), 0, False),
-            ("Total params",         pa['total'],   pb['total'],    0, False),
+            ("Peak GPU memory (MB)",                  ma['peak_mb'], mb['peak_mb'], 1, True),
+            (f"Encoder ({enc_label_a} / {enc_label_b})", enc_a,     enc_b,         0, False),
+            ("MLP params",                            pa.get('mlps', 0), pb.get('mlps', 0), 0, False),
+            ("Total params",                          pa['total'],  pb['total'],   0, False),
         ], (la, lb))
     else:
-        print("\n  -- Speed -- (run evaluate.py or benchmark.py on each output dir first)")
+        print("\n  -- Speed -- (run evaluate.py on each output dir first)")
 
     print()
     print("  down = better for lower-is-better   up = better for higher-is-better")

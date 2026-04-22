@@ -13,22 +13,295 @@ Usage:
 """
 
 import argparse
+import copy
 import json
 import os
 import sys
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 sys.path.append('.')
 from src import config
+from src.common import get_samples, matrix_to_cam_pose, cam_pose_to_matrix
 from src.utils.datasets import get_dataset
-from benchmark import (
-    cuda_timer, gpu_mem_mb, make_planes, count_plane_params,
-    bench_plane_lookup, bench_decoder_forward, bench_decoder_backward,
-    bench_render_batch, bench_cnn_feature_extraction,
-    bench_mapping_iteration, bench_tracking_iteration,
-)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def cuda_timer(fn, warmup=3, repeats=10):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(repeats):
+        start = torch.cuda.Event(enable_timing=True)
+        end   = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return {
+        "mean_ms": float(np.mean(times)),
+        "std_ms":  float(np.std(times)),
+        "min_ms":  float(np.min(times)),
+        "max_ms":  float(np.max(times)),
+    }
+
+
+def gpu_mem_mb():
+    torch.cuda.synchronize()
+    return torch.cuda.max_memory_allocated() / 1024 / 1024
+
+
+def make_planes(cfg, bound, device):
+    c_dim   = cfg['model']['c_dim']
+    xyz_len = bound[:, 1] - bound[:, 0]
+
+    def _make_group(res_list):
+        xy, xz, yz = [], [], []
+        for grid_res in res_list:
+            gs = list(map(int, (xyz_len / grid_res).tolist()))
+            gs[0], gs[2] = gs[2], gs[0]
+            xy.append(torch.empty([1, c_dim, *gs[1:]]).normal_(mean=0, std=0.01).to(device))
+            xz.append(torch.empty([1, c_dim, gs[0], gs[2]]).normal_(mean=0, std=0.01).to(device))
+            yz.append(torch.empty([1, c_dim, *gs[:2]]).normal_(mean=0, std=0.01).to(device))
+        return xy, xz, yz
+
+    sdf_xy, sdf_xz, sdf_yz = _make_group([cfg['planes_res']['coarse'],   cfg['planes_res']['fine']])
+    c_xy,   c_xz,   c_yz   = _make_group([cfg['c_planes_res']['coarse'], cfg['c_planes_res']['fine']])
+    s_xy,   s_xz,   s_yz   = _make_group([cfg['s_planes_res']['coarse'], cfg['s_planes_res']['fine']])
+    return (sdf_xy, sdf_xz, sdf_yz, c_xy, c_xz, c_yz, s_xy, s_xz, s_yz)
+
+
+def count_plane_params(all_planes):
+    return sum(p.numel() for group in all_planes for p in group)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark stages
+# ---------------------------------------------------------------------------
+
+def bench_plane_lookup(all_planes, bound, device):
+    n_points = 500_000
+    pts = torch.rand(n_points, 3, device=device)
+    lo, hi = bound[:, 0].to(device), bound[:, 1].to(device)
+    pts = lo + pts * (hi - lo)
+    sdf_planes = all_planes[:3]
+
+    def fn():
+        with torch.no_grad():
+            from src.common import normalize_3d_coordinate
+            pts_norm = normalize_3d_coordinate(pts.clone(), bound.to(device))
+            for planes in sdf_planes:
+                for plane in planes:
+                    pts_2d = pts_norm[:, :2].unsqueeze(0).unsqueeze(0)
+                    torch.nn.functional.grid_sample(
+                        plane, pts_2d, align_corners=True, mode='bilinear', padding_mode='border')
+
+    stats = cuda_timer(fn)
+    stats["n_points"] = n_points
+    stats["throughput_Mpts_s"] = round(n_points / stats["mean_ms"] / 1000, 2)
+    return stats
+
+
+def bench_decoder_forward(decoders, all_planes, bound, device):
+    n_points = 200_000
+    pts = torch.rand(n_points, 3, device=device)
+    lo, hi = bound[:, 0].to(device), bound[:, 1].to(device)
+    pts = lo + pts * (hi - lo)
+
+    def fn():
+        with torch.no_grad():
+            _ = decoders(pts, all_planes)
+
+    stats = cuda_timer(fn)
+    stats["n_points"] = n_points
+    stats["throughput_Mpts_s"] = round(n_points / stats["mean_ms"] / 1000, 2)
+    return stats
+
+
+def bench_decoder_backward(decoders, all_planes, bound, device):
+    n_points = 50_000
+    pts = torch.rand(n_points, 3, device=device)
+    lo, hi = bound[:, 0].to(device), bound[:, 1].to(device)
+    pts = lo + pts * (hi - lo)
+    planes_params = [nn.Parameter(p) for group in all_planes for p in group]
+    optimizer = torch.optim.Adam(list(decoders.parameters()) + planes_params, lr=1e-3)
+
+    def fn():
+        optimizer.zero_grad()
+        raw, _ = decoders(pts, all_planes)
+        raw.sum().backward()
+        optimizer.step()
+
+    stats = cuda_timer(fn, warmup=3, repeats=10)
+    stats["n_points"] = n_points
+    return stats
+
+
+def bench_render_batch(renderer, decoders, all_planes, frame_data, cfg, device):
+    _, gt_color, gt_depth, gt_c2w, _ = frame_data
+    gt_color = gt_color.to(device)
+    gt_depth = gt_depth.to(device)
+    gt_c2w   = gt_c2w.to(device)
+
+    H, W       = cfg['cam']['H'], cfg['cam']['W']
+    fx, fy     = cfg['cam']['fx'], cfg['cam']['fy']
+    cx, cy     = cfg['cam']['cx'], cfg['cam']['cy']
+    truncation = cfg['model']['truncation']
+    c_dim      = cfg['model']['c_dim']
+    n_rays     = cfg['mapping']['pixels']
+    c2w        = gt_c2w.unsqueeze(0)
+
+    def fn():
+        with torch.no_grad():
+            rays_o, rays_d, batch_depth, batch_color, _, _, _ = get_samples(
+                0, H, 0, W, n_rays, H, W, fx, fy, cx, cy,
+                c2w, gt_depth.unsqueeze(0), gt_color.unsqueeze(0),
+                device=device, dim=c_dim)
+            renderer.render_batch_ray(
+                all_planes, decoders, rays_d, rays_o, device, truncation, gt_depth=batch_depth)
+
+    stats = cuda_timer(fn, warmup=2, repeats=8)
+    stats["n_rays"] = n_rays
+    stats["throughput_Krays_s"] = round(n_rays / stats["mean_ms"], 2)
+    return stats
+
+
+def bench_cnn_feature_extraction(model_manager, frame_data, cfg, device):
+    _, gt_color, _, _, _ = frame_data
+    frame_rgb = gt_color.to(device).permute(2, 0, 1).unsqueeze(0)
+
+    def fn():
+        with torch.no_grad():
+            model_manager.set_mode_feature()
+            _ = model_manager.cnn(frame_rgb)
+
+    return cuda_timer(fn, warmup=3, repeats=10)
+
+
+def bench_mapping_iteration(decoders, all_planes, renderer, model_manager, frame_data, cfg, device):
+    _, gt_color, gt_depth, gt_c2w, gt_semantic = frame_data
+    gt_color    = gt_color.to(device)
+    gt_depth    = gt_depth.to(device)
+    gt_c2w      = gt_c2w.to(device)
+    gt_semantic = gt_semantic.to(device)
+
+    H, W       = cfg['cam']['H'], cfg['cam']['W']
+    fx, fy     = cfg['cam']['fx'], cfg['cam']['fy']
+    cx, cy     = cfg['cam']['cx'], cfg['cam']['cy']
+    truncation = cfg['model']['truncation']
+    c_dim      = cfg['model']['c_dim']
+    n_rays     = cfg['mapping']['pixels']
+    c2w        = gt_c2w.unsqueeze(0)
+
+    with torch.no_grad():
+        frame_rgb = gt_color.permute(2, 0, 1).unsqueeze(0).to(device)
+        model_manager.set_mode_feature()
+        sem_feat    = model_manager.cnn(frame_rgb)
+        rgb_feat    = model_manager.head(sem_feat)
+        sem_feat_sq = sem_feat.squeeze(0)
+        rgb_feat_sq = rgb_feat.squeeze(0)
+
+    kf_sem = sem_feat_sq.unsqueeze(0)
+    kf_rgb = rgb_feat_sq.unsqueeze(0)
+    model_manager.set_mode_result()
+    with torch.no_grad():
+        gt_sem_label = model_manager.cnn(frame_rgb)
+    kf_gt_label = gt_sem_label.unsqueeze(0)
+
+    planes_params = [nn.Parameter(p.clone()) for group in all_planes for p in group]
+    optimizer  = torch.optim.Adam(list(decoders.parameters()) + planes_params, lr=1e-3)
+    ce_loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
+
+    w_color    = cfg['mapping']['w_color']
+    w_depth    = cfg['mapping']['w_depth']
+    w_semantic = cfg['mapping']['w_semantic']
+    w_feature  = cfg['mapping']['w_feature']
+    w_sdf_fs   = cfg['mapping']['w_sdf_fs']
+
+    def fn():
+        optimizer.zero_grad()
+        rays_o, rays_d, batch_depth, batch_color, batch_sem, batch_rgb, batch_label = get_samples(
+            0, H, 0, W, n_rays, H, W, fx, fy, cx, cy,
+            c2w, gt_depth.unsqueeze(0), gt_color.unsqueeze(0),
+            sem_feats=kf_sem, rgb_feats=kf_rgb, gt_label=kf_gt_label,
+            device=device, dim=c_dim)
+
+        depth, color, sdf, z_vals, gt_feat, plane_feat, render_semantic = renderer.render_batch_ray(
+            all_planes, decoders, rays_d, rays_o, device, truncation,
+            gt_depth=batch_depth, sem_feats=batch_sem, rgb_feats=batch_rgb, return_emb=True)
+
+        front_mask = (z_vals < (batch_depth[:, None] - truncation)).bool()
+        depth_mask = (batch_depth > 0)
+        loss = (w_sdf_fs   * torch.mean(torch.square(sdf[front_mask] - 1.0))
+              + w_color    * torch.square(batch_color - color).mean()
+              + w_depth    * torch.square(batch_depth[depth_mask] - depth[depth_mask]).mean()
+              + w_feature  * (gt_feat.detach() - plane_feat.detach()).abs().mean()
+              + w_semantic * ce_loss_fn(render_semantic, batch_label))
+        loss.backward()
+        optimizer.step()
+
+    stats = cuda_timer(fn, warmup=2, repeats=8)
+    stats["n_rays"] = n_rays
+    return stats
+
+
+def bench_tracking_iteration(decoders, all_planes, renderer, frame_data, cfg, device):
+    _, gt_color, gt_depth, gt_c2w, _ = frame_data
+    gt_color = gt_color.to(device)
+    gt_depth = gt_depth.to(device)
+    gt_c2w   = gt_c2w.to(device)
+
+    H, W          = cfg['cam']['H'], cfg['cam']['W']
+    fx, fy        = cfg['cam']['fx'], cfg['cam']['fy']
+    cx, cy        = cfg['cam']['cx'], cfg['cam']['cy']
+    truncation    = cfg['model']['truncation']
+    c_dim         = cfg['model']['c_dim']
+    n_rays        = cfg['tracking']['pixels']
+    ignore_edge_H = cfg['tracking']['ignore_edge_H']
+    ignore_edge_W = cfg['tracking']['ignore_edge_W']
+
+    cam_pose = matrix_to_cam_pose(gt_c2w.unsqueeze(0))
+    T = torch.nn.Parameter(cam_pose[:, -3:].clone())
+    R = torch.nn.Parameter(cam_pose[:, :4].clone())
+    optimizer = torch.optim.Adam([
+        {'params': [T], 'lr': cfg['tracking']['lr_T'], 'betas': (0.5, 0.999)},
+        {'params': [R], 'lr': cfg['tracking']['lr_R'], 'betas': (0.5, 0.999)},
+    ])
+
+    frozen = copy.deepcopy(decoders)
+    for p in frozen.parameters():
+        p.requires_grad_(False)
+
+    def fn():
+        cam    = torch.cat([R, T], -1)
+        c2w    = cam_pose_to_matrix(cam)
+        rays_o, rays_d, batch_depth, batch_color, _, _, _ = get_samples(
+            ignore_edge_H, H - ignore_edge_H,
+            ignore_edge_W, W - ignore_edge_W,
+            n_rays, H, W, fx, fy, cx, cy,
+            c2w, gt_depth.unsqueeze(0), gt_color.unsqueeze(0),
+            device=device, dim=c_dim)
+
+        depth, color, sdf, z_vals, _, _, _ = renderer.render_batch_ray(
+            all_planes, frozen, rays_d, rays_o, device, truncation, gt_depth=batch_depth)
+
+        depth_mask = (batch_depth > 0)
+        loss = (torch.square(batch_depth[depth_mask] - depth[depth_mask]).mean()
+              + 5.0 * torch.square(batch_color - color).mean())
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    stats = cuda_timer(fn, warmup=2, repeats=8)
+    stats["n_rays"] = n_rays
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -45,8 +318,8 @@ def eval_ate(output_dir, scale):
     if not ckpts:
         return None
 
-    ckpt    = torch.load(os.path.join(ckptsdir, ckpts[-1]), map_location='cpu')
-    N       = ckpt['idx']
+    ckpt      = torch.load(os.path.join(ckptsdir, ckpts[-1]), map_location='cpu')
+    N         = ckpt['idx']
     poses_gt,  mask = convert_poses(ckpt['gt_c2w_list'],       N, scale)
     poses_est, _    = convert_poses(ckpt['estimate_c2w_list'], N, scale)
     poses_est = poses_est[mask]
@@ -172,13 +445,13 @@ def main():
     mem_after_init = gpu_mem_mb()
 
     timing = {}
-    timing['plane_lookup']      = bench_plane_lookup(all_planes, bound, device)
-    timing['decoder_fwd']       = bench_decoder_forward(decoders, all_planes, bound, device)
-    timing['decoder_bwd']       = bench_decoder_backward(decoders, all_planes, bound, device)
-    timing['render_batch']      = bench_render_batch(renderer, decoders, all_planes, frame_data, cfg, device)
-    timing['cnn']               = bench_cnn_feature_extraction(model_manager, frame_data, cfg, device)
-    timing['mapping_iter']      = bench_mapping_iteration(decoders, all_planes, renderer, model_manager, frame_data, cfg, device)
-    timing['tracking_iter']     = bench_tracking_iteration(decoders, all_planes, renderer, frame_data, cfg, device)
+    timing['plane_lookup']  = bench_plane_lookup(all_planes, bound, device)
+    timing['decoder_fwd']   = bench_decoder_forward(decoders, all_planes, bound, device)
+    timing['decoder_bwd']   = bench_decoder_backward(decoders, all_planes, bound, device)
+    timing['render_batch']  = bench_render_batch(renderer, decoders, all_planes, frame_data, cfg, device)
+    timing['cnn']           = bench_cnn_feature_extraction(model_manager, frame_data, cfg, device)
+    timing['mapping_iter']  = bench_mapping_iteration(decoders, all_planes, renderer, model_manager, frame_data, cfg, device)
+    timing['tracking_iter'] = bench_tracking_iteration(decoders, all_planes, renderer, frame_data, cfg, device)
     mem_peak = gpu_mem_mb()
 
     map_iters    = cfg['mapping']['iters']

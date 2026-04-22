@@ -31,17 +31,245 @@ from src import config
 from src.common import get_samples, get_rays, matrix_to_cam_pose, cam_pose_to_matrix
 from src.utils.datasets import get_dataset
 
-# reuse timing helpers from benchmark.py
-from benchmark import (
-    cuda_timer, gpu_mem_mb,
-    bench_hash_field_forward,
-    bench_decoder_forward,
-    bench_decoder_backward,
-    bench_render_batch,
-    bench_cnn_feature_extraction,
-    bench_mapping_iteration,
-    bench_tracking_iteration,
-)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def cuda_timer(fn, warmup=3, repeats=10):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(repeats):
+        start = torch.cuda.Event(enable_timing=True)
+        end   = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return {
+        "mean_ms": float(np.mean(times)),
+        "std_ms":  float(np.std(times)),
+        "min_ms":  float(np.min(times)),
+        "max_ms":  float(np.max(times)),
+    }
+
+
+def gpu_mem_mb():
+    torch.cuda.synchronize()
+    return torch.cuda.max_memory_allocated() / 1024 / 1024
+
+
+# ---------------------------------------------------------------------------
+# Benchmark stages
+# ---------------------------------------------------------------------------
+
+def bench_hash_field_forward(decoders, bound, device):
+    n_points = 500_000
+    pts = torch.rand(n_points, 3, device=device)
+    lo, hi = bound[:, 0].to(device), bound[:, 1].to(device)
+    pts = lo + pts * (hi - lo)
+
+    def fn():
+        with torch.no_grad():
+            _ = decoders.hash_sdf(pts)
+
+    stats = cuda_timer(fn)
+    stats["n_points"] = n_points
+    stats["throughput_Mpts_s"] = round(n_points / stats["mean_ms"] / 1000, 2)
+    return stats
+
+
+def bench_decoder_forward(decoders, bound, device):
+    n_points = 200_000
+    pts = torch.rand(n_points, 3, device=device)
+    lo, hi = bound[:, 0].to(device), bound[:, 1].to(device)
+    pts = lo + pts * (hi - lo)
+
+    def fn():
+        with torch.no_grad():
+            _ = decoders(pts)
+
+    stats = cuda_timer(fn)
+    stats["n_points"] = n_points
+    stats["throughput_Mpts_s"] = round(n_points / stats["mean_ms"] / 1000, 2)
+    return stats
+
+
+def bench_decoder_backward(decoders, bound, device):
+    n_points = 50_000
+    pts = torch.rand(n_points, 3, device=device)
+    lo, hi = bound[:, 0].to(device), bound[:, 1].to(device)
+    pts = lo + pts * (hi - lo)
+    optimizer = torch.optim.Adam(decoders.parameters(), lr=1e-3)
+
+    def fn():
+        optimizer.zero_grad()
+        raw, _ = decoders(pts)
+        raw.sum().backward()
+        optimizer.step()
+
+    stats = cuda_timer(fn, warmup=3, repeats=10)
+    stats["n_points"] = n_points
+    return stats
+
+
+def bench_render_batch(renderer, decoders, frame_data, cfg, device):
+    _, gt_color, gt_depth, gt_c2w, _ = frame_data
+    gt_color = gt_color.to(device)
+    gt_depth = gt_depth.to(device)
+    gt_c2w   = gt_c2w.to(device)
+
+    H, W       = cfg['cam']['H'], cfg['cam']['W']
+    fx, fy     = cfg['cam']['fx'], cfg['cam']['fy']
+    cx, cy     = cfg['cam']['cx'], cfg['cam']['cy']
+    truncation = cfg['model']['truncation']
+    c_dim      = cfg['model']['c_dim']
+    n_rays     = cfg['mapping']['pixels']
+    c2w        = gt_c2w.unsqueeze(0)
+
+    def fn():
+        with torch.no_grad():
+            rays_o, rays_d, batch_depth, batch_color, _, _, _ = get_samples(
+                0, H, 0, W, n_rays, H, W, fx, fy, cx, cy,
+                c2w, gt_depth.unsqueeze(0), gt_color.unsqueeze(0),
+                device=device, dim=c_dim)
+            renderer.render_batch_ray(
+                decoders, rays_d, rays_o, device, truncation, gt_depth=batch_depth)
+
+    stats = cuda_timer(fn, warmup=2, repeats=8)
+    stats["n_rays"] = n_rays
+    stats["throughput_Krays_s"] = round(n_rays / stats["mean_ms"], 2)
+    return stats
+
+
+def bench_cnn_feature_extraction(model_manager, frame_data, cfg, device):
+    _, gt_color, _, _, _ = frame_data
+    frame_rgb = gt_color.to(device).permute(2, 0, 1).unsqueeze(0)
+
+    def fn():
+        with torch.no_grad():
+            model_manager.set_mode_feature()
+            _ = model_manager.cnn(frame_rgb)
+
+    return cuda_timer(fn, warmup=3, repeats=10)
+
+
+def bench_mapping_iteration(decoders, renderer, model_manager, frame_data, cfg, device):
+    _, gt_color, gt_depth, gt_c2w, gt_semantic = frame_data
+    gt_color    = gt_color.to(device)
+    gt_depth    = gt_depth.to(device)
+    gt_c2w      = gt_c2w.to(device)
+    gt_semantic = gt_semantic.to(device)
+
+    H, W       = cfg['cam']['H'], cfg['cam']['W']
+    fx, fy     = cfg['cam']['fx'], cfg['cam']['fy']
+    cx, cy     = cfg['cam']['cx'], cfg['cam']['cy']
+    truncation = cfg['model']['truncation']
+    c_dim      = cfg['model']['c_dim']
+    n_rays     = cfg['mapping']['pixels']
+    c2w        = gt_c2w.unsqueeze(0)
+
+    with torch.no_grad():
+        frame_rgb = gt_color.permute(2, 0, 1).unsqueeze(0).to(device)
+        model_manager.set_mode_feature()
+        sem_feat    = model_manager.cnn(frame_rgb)
+        rgb_feat    = model_manager.head(sem_feat)
+        sem_feat_sq = sem_feat.squeeze(0)
+        rgb_feat_sq = rgb_feat.squeeze(0)
+
+    kf_sem = sem_feat_sq.unsqueeze(0)
+    kf_rgb = rgb_feat_sq.unsqueeze(0)
+    model_manager.set_mode_result()
+    with torch.no_grad():
+        gt_sem_label = model_manager.cnn(frame_rgb)
+    kf_gt_label = gt_sem_label.unsqueeze(0)
+
+    optimizer  = torch.optim.Adam(decoders.parameters(), lr=1e-3)
+    ce_loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
+
+    w_color    = cfg['mapping']['w_color']
+    w_depth    = cfg['mapping']['w_depth']
+    w_semantic = cfg['mapping']['w_semantic']
+    w_sdf_fs   = cfg['mapping']['w_sdf_fs']
+
+    def fn():
+        optimizer.zero_grad()
+        rays_o, rays_d, batch_depth, batch_color, batch_sem, batch_rgb, batch_label = get_samples(
+            0, H, 0, W, n_rays, H, W, fx, fy, cx, cy,
+            c2w, gt_depth.unsqueeze(0), gt_color.unsqueeze(0),
+            sem_feats=kf_sem, rgb_feats=kf_rgb, gt_label=kf_gt_label,
+            device=device, dim=c_dim)
+
+        depth, color, sdf, z_vals, _, _, render_semantic = renderer.render_batch_ray(
+            decoders, rays_d, rays_o, device, truncation,
+            gt_depth=batch_depth, sem_feats=batch_sem, rgb_feats=batch_rgb)
+
+        front_mask = (z_vals < (batch_depth[:, None] - truncation)).bool()
+        depth_mask = (batch_depth > 0)
+        loss = (w_sdf_fs  * torch.mean(torch.square(sdf[front_mask] - 1.0))
+              + w_color   * torch.square(batch_color - color).mean()
+              + w_depth   * torch.square(batch_depth[depth_mask] - depth[depth_mask]).mean()
+              + w_semantic * ce_loss_fn(render_semantic, batch_label))
+        loss.backward()
+        optimizer.step()
+
+    stats = cuda_timer(fn, warmup=2, repeats=8)
+    stats["n_rays"] = n_rays
+    return stats
+
+
+def bench_tracking_iteration(decoders, renderer, frame_data, cfg, device):
+    _, gt_color, gt_depth, gt_c2w, _ = frame_data
+    gt_color = gt_color.to(device)
+    gt_depth = gt_depth.to(device)
+    gt_c2w   = gt_c2w.to(device)
+
+    H, W          = cfg['cam']['H'], cfg['cam']['W']
+    fx, fy        = cfg['cam']['fx'], cfg['cam']['fy']
+    cx, cy        = cfg['cam']['cx'], cfg['cam']['cy']
+    truncation    = cfg['model']['truncation']
+    c_dim         = cfg['model']['c_dim']
+    n_rays        = cfg['tracking']['pixels']
+    ignore_edge_H = cfg['tracking']['ignore_edge_H']
+    ignore_edge_W = cfg['tracking']['ignore_edge_W']
+
+    cam_pose = matrix_to_cam_pose(gt_c2w.unsqueeze(0))
+    T = torch.nn.Parameter(cam_pose[:, -3:].clone())
+    R = torch.nn.Parameter(cam_pose[:, :4].clone())
+    optimizer = torch.optim.Adam([
+        {'params': [T], 'lr': cfg['tracking']['lr_T'], 'betas': (0.5, 0.999)},
+        {'params': [R], 'lr': cfg['tracking']['lr_R'], 'betas': (0.5, 0.999)},
+    ])
+
+    frozen = copy.deepcopy(decoders)
+    for p in frozen.parameters():
+        p.requires_grad_(False)
+
+    def fn():
+        cam    = torch.cat([R, T], -1)
+        c2w    = cam_pose_to_matrix(cam)
+        rays_o, rays_d, batch_depth, batch_color, _, _, _ = get_samples(
+            ignore_edge_H, H - ignore_edge_H,
+            ignore_edge_W, W - ignore_edge_W,
+            n_rays, H, W, fx, fy, cx, cy,
+            c2w, gt_depth.unsqueeze(0), gt_color.unsqueeze(0),
+            device=device, dim=c_dim)
+
+        depth, color, sdf, z_vals, _, _, _ = renderer.render_batch_ray(
+            frozen, rays_d, rays_o, device, truncation, gt_depth=batch_depth)
+
+        depth_mask = (batch_depth > 0)
+        loss = (torch.square(batch_depth[depth_mask] - depth[depth_mask]).mean()
+              + 5.0 * torch.square(batch_color - color).mean())
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    stats = cuda_timer(fn, warmup=2, repeats=8)
+    stats["n_rays"] = n_rays
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +611,7 @@ def main():
     # ── 6. Save JSON ──────────────────────────────────────────────────────
     os.makedirs('results', exist_ok=True)
     scene_tag = os.path.basename(args.config).replace('.yaml', '')
-    out_path  = f'results/eval_{scene_tag}.json'
+    out_path  = f'results/eval_{scene_tag}_hash.json'
 
     # make results JSON-serialisable
     def _to_serialisable(obj):

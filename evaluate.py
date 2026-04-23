@@ -611,7 +611,7 @@ def main():
     # ── 6. Save JSON ──────────────────────────────────────────────────────
     os.makedirs('results', exist_ok=True)
     scene_tag = os.path.basename(args.config).replace('.yaml', '')
-    out_path  = f'results/eval_{scene_tag}_hash.json'
+    out_path  = f'results/eval_{scene_tag}_fused.json'
 
     # make results JSON-serialisable
     def _to_serialisable(obj):

@@ -12,7 +12,7 @@ wandb/
 *.log
 
 #data/output
-data/
+data*/
 seg/
 output*
 results/

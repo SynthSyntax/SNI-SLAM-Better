@@ -89,7 +89,7 @@ model:
   truncation: 0.06
   hidden_dim: 32
   fused_hidden_dim: 16
-  sem_hidden_dim: 256
+  sem_hidden_dim: 128
   encoder:
     multires: 6
   cnn:

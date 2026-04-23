@@ -10,7 +10,7 @@ __pycache__/
 wandb/
 
 #data and output folders
-data/
+data*/
 seg/
 output*
 results*

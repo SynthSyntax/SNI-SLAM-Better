@@ -1,5 +1,5 @@
 """
-Extensive quality comparison between two completed SNI-SLAM runs.
+Extensive quality comparison between two or more completed SNI-SLAM runs.
 
 Works with both feature-planes (main) and hash-grid (hash_encoding) runs,
 since it only reads checkpoints, meshes, and benchmark_results.json.
@@ -103,30 +103,53 @@ def load_eval(output_dir, label):
     return None
 
 
+METRIC_W = 36
+VAL_W    = 11
+DIFF_W   = 11   # 8 for number + space + 2 for arrow symbol
+
+
 def fmt(v, decimals=3):
     if v is None: return "N/A"
     if isinstance(v, float): return f"{v:.{decimals}f}"
     return str(v)
 
 
-def pct_diff(a, b):
-    if a is None or b is None or a == 0: return ""
-    d = (b - a) / a * 100
+def pct_diff(base, v):
+    if base is None or v is None or base == 0: return ""
+    d = (v - base) / base * 100
     return f"{'+'if d>0 else ''}{d:.1f}%"
 
 
 def print_section(title, rows, labels):
-    la, lb = labels
-    print(f"\n  -- {title} --")
-    print(f"  {'Metric':<35} {la:>12} {lb:>12}  {'diff':>8}")
-    print("  " + "-" * 70)
-    for label, va, vb, decimals, lower_better in rows:
-        diff   = pct_diff(va, vb)
-        marker = ""
-        if va is not None and vb is not None:
-            if lower_better: marker = " down" if vb < va else (" up" if vb > va else "  ")
-            else:            marker = " up"   if vb > va else (" down" if vb < va else "  ")
-        print(f"  {label:<35} {fmt(va, decimals):>12} {fmt(vb, decimals):>12}  {diff:>8}{marker}")
+    """rows: list of (metric_label, [val_per_run], decimals, lower_better)"""
+    n = len(labels)
+
+    hdr = f"  {'Metric':<{METRIC_W}}"
+    for lbl in labels:
+        hdr += f" {lbl:>{VAL_W}}"
+    for lbl in labels[1:]:
+        hdr += f" {'Δ'+lbl:>{DIFF_W}}"
+
+    sep = 2 + METRIC_W + n * (VAL_W + 1) + (n - 1) * (DIFF_W + 1)
+
+    print(f"\n  ── {title} ──")
+    print(hdr)
+    print("  " + "─" * (sep - 2))
+
+    for metric_label, vals, decimals, lower_better in rows:
+        line = f"  {metric_label:<{METRIC_W}}"
+        for v in vals:
+            line += f" {fmt(v, decimals):>{VAL_W}}"
+        base = vals[0]
+        for v in vals[1:]:
+            diff = pct_diff(base, v)
+            arrow = ""
+            if base is not None and v is not None and diff:
+                if lower_better: arrow = " ↓" if v < base else " ↑"
+                else:            arrow = " ↑" if v > base else " ↓"
+            cell = f"{diff}{arrow}"
+            line += f" {cell:>{DIFF_W}}"
+        print(line)
 
 
 def main():
@@ -140,9 +163,8 @@ def main():
     runs    = {k: v for item in args.runs    for k, v in [item.split(':', 1)]}
     cfg_map = {k: v for item in args.configs for k, v in [item.split(':', 1)]}
     labels  = list(runs.keys())
-    if len(labels) != 2:
-        print("Exactly 2 runs required."); sys.exit(1)
-    la, lb = labels
+    if len(labels) < 2:
+        print("At least 2 runs required."); sys.exit(1)
 
     def get_scale(label):
         if label in cfg_map:
@@ -153,56 +175,54 @@ def main():
     print("=" * 80)
     print("  SNI-SLAM Comparison")
     print("=" * 80)
-    print(f"  {la}: {runs[la]}")
-    print(f"  {lb}: {runs[lb]}")
+    for lbl in labels:
+        marker = "  [baseline]" if lbl == labels[0] else ""
+        print(f"  {lbl}: {runs[lbl]}{marker}")
 
-    ate_a = eval_ate(runs[la], get_scale(la))
-    ate_b = eval_ate(runs[lb], get_scale(lb))
+    ates = [eval_ate(runs[lbl], get_scale(lbl)) for lbl in labels]
     print_section("Tracking -- ATE (lower is better)", [
-        ("ATE RMSE (cm)",   ate_a and ate_a['ate_rmse_cm'],   ate_b and ate_b['ate_rmse_cm'],   3, True),
-        ("ATE mean (cm)",   ate_a and ate_a['ate_mean_cm'],   ate_b and ate_b['ate_mean_cm'],   3, True),
-        ("ATE median (cm)", ate_a and ate_a['ate_median_cm'], ate_b and ate_b['ate_median_cm'], 3, True),
-    ], (la, lb))
+        ("ATE RMSE (cm)",   [a and a['ate_rmse_cm']   for a in ates], 3, True),
+        ("ATE mean (cm)",   [a and a['ate_mean_cm']   for a in ates], 3, True),
+        ("ATE median (cm)", [a and a['ate_median_cm'] for a in ates], 3, True),
+    ], labels)
 
     if args.gt_mesh:
-        m_a = eval_mesh_3d(runs[la], args.gt_mesh)
-        m_b = eval_mesh_3d(runs[lb], args.gt_mesh)
+        meshes = [eval_mesh_3d(runs[lbl], args.gt_mesh) for lbl in labels]
         print_section("Reconstruction (accuracy/completion lower better, ratio higher better)", [
-            ("Accuracy (cm)",        m_a and m_a['accuracy_cm'],        m_b and m_b['accuracy_cm'],        3, True),
-            ("Completion (cm)",      m_a and m_a['completion_cm'],      m_b and m_b['completion_cm'],      3, True),
-            ("Completion Ratio (%)", m_a and m_a['completion_ratio_%'], m_b and m_b['completion_ratio_%'], 2, False),
-        ], (la, lb))
+            ("Accuracy (cm)",        [m and m['accuracy_cm']        for m in meshes], 3, True),
+            ("Completion (cm)",      [m and m['completion_cm']      for m in meshes], 3, True),
+            ("Completion Ratio (%)", [m and m['completion_ratio_%'] for m in meshes], 2, False),
+        ], labels)
     else:
         print("\n  -- Reconstruction -- (skipped: no --gt_mesh)")
 
-    ba = load_eval(runs[la], la)
-    bb = load_eval(runs[lb], lb)
-    if ba and bb:
-        ea, eb = ba['estimates'], bb['estimates']
-        ma, mb = ba['memory'],    bb['memory']
-        pa, pb = ba['params'],    bb['params']
-        # encoder key differs: hash uses 'hash_grids', planes uses 'feature_planes'
-        enc_a = pa.get('hash_grids') or pa.get('feature_planes') or 0
-        enc_b = pb.get('hash_grids') or pb.get('feature_planes') or 0
-        enc_label_a = 'hash grids' if 'hash_grids' in pa else 'feature planes'
-        enc_label_b = 'hash grids' if 'hash_grids' in pb else 'feature planes'
+    evals = [load_eval(runs[lbl], lbl) for lbl in labels]
+    if all(evals):
+        estimates = [e['estimates'] for e in evals]
+        memories  = [e['memory']    for e in evals]
+        params    = [e['params']    for e in evals]
+
+        def enc_params(p):
+            return p.get('hash_grids') or p.get('feature_planes') or 0
+
         print_section("Speed (lower is better)", [
-            ("Mapping per frame (ms)",   ea['mapping_per_frame_ms'],   eb['mapping_per_frame_ms'],   1, True),
-            ("Tracking per frame (ms)",  ea['tracking_per_frame_ms'],  eb['tracking_per_frame_ms'],  1, True),
-            ("Effective per frame (ms)", ea['effective_per_frame_ms'], eb['effective_per_frame_ms'], 1, True),
-            ("Est. total run (min)",     ea['est_total_min'],          eb['est_total_min'],          1, True),
-        ], (la, lb))
+            ("Mapping per frame (ms)",   [e['mapping_per_frame_ms']   for e in estimates], 1, True),
+            ("Tracking per frame (ms)",  [e['tracking_per_frame_ms']  for e in estimates], 1, True),
+            ("Effective per frame (ms)", [e['effective_per_frame_ms'] for e in estimates], 1, True),
+            ("Est. total run (min)",     [e['est_total_min']          for e in estimates], 1, True),
+        ], labels)
         print_section("Memory & Model size", [
-            ("Peak GPU memory (MB)",                  ma['peak_mb'], mb['peak_mb'], 1, True),
-            (f"Encoder ({enc_label_a} / {enc_label_b})", enc_a,     enc_b,         0, False),
-            ("MLP params",                            pa.get('mlps', 0), pb.get('mlps', 0), 0, False),
-            ("Total params",                          pa['total'],  pb['total'],   0, False),
-        ], (la, lb))
+            ("Peak GPU memory (MB)",   [m['peak_mb']      for m in memories], 1, True),
+            ("Encoder params",         [enc_params(p)    for p in params],   0, False),
+            ("MLP params",                        [p.get('mlps', 0) for p in params],   0, False),
+            ("Total params",                      [p['total']       for p in params],   0, False),
+        ], labels)
     else:
         print("\n  -- Speed -- (run evaluate.py on each output dir first)")
 
     print()
-    print("  down = better for lower-is-better   up = better for higher-is-better")
+    print("  ↓ = improvement for lower-is-better   ↑ = improvement for higher-is-better")
+    print("  Δ columns are relative to the first run (baseline)")
     print("=" * 80)
     print()
 
